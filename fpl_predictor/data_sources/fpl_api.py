@@ -91,6 +91,10 @@ def players_and_teams_from_bootstrap(bootstrap: dict) -> tuple[pd.DataFrame, pd.
         "id", "first_name", "second_name", "web_name", "now_cost", "element_type",
         "team", "team_name", "total_points", "minutes", "points_per_game", "news", "status",
         "chance_of_playing_next_round", "selected_by_percent", "form",
+        # Set-piece duty order: 1 = primary taker, 2 = second choice, etc.
+        # (null/missing = not on the list). A season-level snapshot, not
+        # per-gameweek -- see the note in features.py on what that implies.
+        "penalties_order", "direct_freekicks_order", "corners_and_indirect_freekicks_order",
     ] if c in players.columns]
     return players[cols].copy(), teams
 

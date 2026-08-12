@@ -26,7 +26,8 @@ import pandas as pd
 
 from fpl_predictor.config import MAX_SQUAD_COST
 from fpl_predictor.features import create_feature_frame, feature_columns_present
-from fpl_predictor.forecast import predict_future_gameweeks
+from fpl_predictor.forecast import apply_playing_probability, predict_future_gameweeks
+from fpl_predictor.minutes_model import train_minutes_model
 from fpl_predictor.model import train_model
 from fpl_predictor.optimizer import build_starting_xi, find_optimal_squad
 from fpl_predictor.pipeline import DataBundle
@@ -95,11 +96,21 @@ def run_backtest(
     end_gw: int | None = None,
     budget: float = MAX_SQUAD_COST,
     tune: bool = False,
+    objective_params: dict | None = None,
+    drop_feature_prefixes: list[str] | None = None,
+    use_minutes_model: bool = True,
 ) -> BacktestReport:
     """Replay the pipeline gameweek-by-gameweek over already-completed
     history. ``tune=False`` (default) skips per-gameweek hyperparameter
     search for speed, since backtesting retrains many times; set
     ``tune=True`` for a slower but more representative run.
+
+    ``objective_params``, ``drop_feature_prefixes``, and
+    ``use_minutes_model`` let a caller (see ``fpl_predictor.ablation``)
+    compare variants of the pipeline against each other -- e.g. Tweedie vs.
+    plain L2, or with/without a given feature group -- using this same
+    walk-forward methodology, so design choices are validated empirically
+    rather than assumed. Leave all three at their defaults for a normal run.
     """
     history_df = data.history_df
     report = BacktestReport()
@@ -122,12 +133,24 @@ def run_backtest(
             continue
 
         feature_cols = feature_columns_present(feat_df)
-        trained_model = train_model(feat_df, feature_cols, tune=tune)
+        if drop_feature_prefixes:
+            feature_cols = [c for c in feature_cols if not any(c.startswith(p) for p in drop_feature_prefixes)]
+        trained_model = train_model(feat_df, feature_cols, tune=tune, objective_params=objective_params)
+        minutes_model = train_minutes_model(feat_df) if use_minutes_model else None
 
-        pred_df = predict_future_gameweeks(trained_model, feat_df, data.players_df, data.fixtures_df, [gw])
+        pred_df = predict_future_gameweeks(trained_model, feat_df, data.players_df, data.fixtures_df, [gw], minutes_model=minutes_model)
         gw_col = f"GW{gw}_Points"
         if pred_df.empty or gw_col not in pred_df.columns:
             continue
+        # Match what a live run actually shows/ranks by: predictions scaled
+        # by playing probability (API status blended with the minutes
+        # model), not the raw model output. (players_df's playing_prob
+        # reflects *today's* status, not the historical status as of this
+        # past gameweek -- a mild look-ahead simplification that only
+        # matters when backtesting against a real past season with injury
+        # history; it's inert for the synthetic demo data, whose
+        # playing_prob is uniformly 1.0.)
+        pred_df = apply_playing_probability(pred_df, data.players_df, [gw_col])
 
         actual_rows = history_df[history_df["round"] == gw][["player_id", "total_points"]].drop_duplicates("player_id")
         if actual_rows.empty:

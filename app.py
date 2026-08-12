@@ -98,9 +98,18 @@ def _backtest_mae_chart(df: pd.DataFrame) -> go.Figure:
 
 
 def _lineup_table(df: pd.DataFrame, gw_col: str, captain_id=None, vice_id=None) -> pd.DataFrame:
-    out = df[["web_name", "team_name", "element_type", "now_cost", gw_col]].copy()
+    cols = ["web_name", "team_name", "element_type", "now_cost", gw_col]
+    has_start_prob = "start_probability" in df.columns
+    if has_start_prob:
+        cols.append("start_probability")
+    out = df[cols].copy()
     out["POS"] = out["element_type"].map(POS_MAP)
-    out = out.drop(columns=["element_type"]).rename(columns={"web_name": "Player", "team_name": "Team", "now_cost": "£m", gw_col: "Pred. Pts"})
+    out = out.drop(columns=["element_type"])
+    rename = {"web_name": "Player", "team_name": "Team", "now_cost": "£m", gw_col: "Pred. Pts"}
+    if has_start_prob:
+        out["start_probability"] = (out["start_probability"] * 100).round(0).astype(int).astype(str) + "%"
+        rename["start_probability"] = "Start %"
+    out = out.rename(columns=rename)
     if captain_id is not None:
         out.insert(0, "", ["\U0001f451" if pid == captain_id else ("\U0001f948" if pid == vice_id else "") for pid in df["player_id"]])
     return out.reset_index(drop=True)
@@ -284,7 +293,12 @@ with tab_explorer:
         view = view[view["web_name"].str.contains(search, case=False, na=False)]
     view["PPM"] = (view["pred_points_total_adj"] / view["now_cost"]).round(2)
 
+    if "start_probability" in view.columns:
+        view["Start %"] = (view["start_probability"] * 100).round(0).astype(int)
+
     show_cols = ["web_name", "team_name", "POS", "now_cost"] + result.gw_cols + ["pred_points_total", "pred_points_total_adj", "PPM"]
+    if "Start %" in view.columns:
+        show_cols.append("Start %")
     show_cols = [c for c in show_cols if c in view.columns]
     st.dataframe(
         view[show_cols].rename(columns={"web_name": "Player", "team_name": "Team", "now_cost": "£m", "pred_points_total": "Total Pred.", "pred_points_total_adj": "Adj. Total"})
@@ -303,7 +317,7 @@ with tab_model:
         )
     else:
         st.caption("Per-position LightGBM models, tuned via walk-forward (time-series) cross-validation.")
-        mcols = st.columns(4)
+        mcols = st.columns(5)
         for col, (pos_id, pos_label) in zip(mcols, POS_MAP.items()):
             pm = result.trained_model.positions.get(pos_id)
             with col:
@@ -312,6 +326,12 @@ with tab_model:
                 else:
                     mae_display = f"{pm.mae:.2f}" if pm.mae == pm.mae else "n/a"  # NaN check
                     st.metric(f"{pos_label} MAE", mae_display, help=f"{pm.n_train_rows} training rows")
+        with mcols[4]:
+            mm = result.minutes_model
+            if mm is not None and mm.model is not None:
+                st.metric("Minutes model Brier", f"{mm.brier_score:.3f}", help="P(60+ mins next GW) classifier — lower Brier score is better (0 = perfect, 0.25 = coin-flip-level)")
+            else:
+                st.metric("Minutes model", "n/a", help="Not enough data yet to train a rotation-risk model this season")
 
         imp_cols = st.columns(2)
         shown = 0
