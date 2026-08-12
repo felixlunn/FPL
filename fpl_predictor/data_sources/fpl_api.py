@@ -121,3 +121,28 @@ def fixtures_df_from_json(fixtures_json: list) -> pd.DataFrame:
         "id", "event", "team_h", "team_a", "team_h_difficulty", "team_a_difficulty", "kickoff_time", "finished",
     ] if c in df.columns]
     return df[keep].copy()
+
+
+def fixtures_long_by_team(fixtures_df: pd.DataFrame) -> pd.DataFrame:
+    """Pivot the fixtures list from one-row-per-match to one-row-per-team-
+    per-fixture: ``team, event, opponent, was_home, difficulty``.
+
+    ``difficulty`` is FPL's own Fixture Difficulty Rating (1 = easiest,
+    5 = hardest) from that team's perspective for that specific fixture --
+    already maintained by FPL itself, so this needs no separate team-
+    strength model or historical data to stay current. Used for both
+    historical feature engineering (join on team+round+opponent) and
+    future-gameweek forecasting (lookup by team+gameweek).
+    """
+    cols = ["team", "event", "opponent", "was_home", "difficulty"]
+    if fixtures_df is None or fixtures_df.empty:
+        return pd.DataFrame(columns=cols)
+    df = fixtures_df.copy()
+    for c in ("team_h_difficulty", "team_a_difficulty"):
+        if c not in df.columns:
+            df[c] = float("nan")  # e.g. a fixtures source that doesn't carry FDR
+    home = df.rename(columns={"team_h": "team", "team_a": "opponent", "team_h_difficulty": "difficulty"})
+    home = home.assign(was_home=True)[cols]
+    away = df.rename(columns={"team_a": "team", "team_h": "opponent", "team_a_difficulty": "difficulty"})
+    away = away.assign(was_home=False)[cols]
+    return pd.concat([home, away], ignore_index=True)

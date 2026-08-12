@@ -7,10 +7,8 @@ any upcoming gameweek.
 ## How it works
 
 ```
-Live FPL API  ──┐
-                ├─▶ feature engineering ─▶ per-position LightGBM models ─▶ ILP squad optimizer ─▶ web UI
-Historical      │        (fpl_predictor/features.py)   (fpl_predictor/model.py)  (fpl_predictor/optimizer.py)
-results (Elo) ──┘
+Live FPL API ─▶ feature engineering ─▶ per-position LightGBM models ─▶ ILP squad optimizer ─▶ web UI
+                 (fpl_predictor/features.py)   (fpl_predictor/model.py)  (fpl_predictor/optimizer.py)
 ```
 
 - **Data**: live player/fixture data comes from the official FPL API
@@ -18,19 +16,18 @@ results (Elo) ──┘
   (`fpl_predictor/data_sources/fpl_api.py`). If the API can't be reached,
   the app automatically falls back to a small synthetic "demo" league so
   it's still usable offline.
-- **Fixture difficulty**: a team-strength Elo rating is computed from the
-  historical Premier League results bundled in this repo
-  (`all-euro-data-*.csv`, `fpl_predictor/data_sources/team_strength.py`).
-  This replaces the placeholder `opponent_strength = 0` from the original
-  prototype with a real, backtestable signal — a player facing a
-  relegation-threatened side is expected to score more than the same
-  player facing the league leaders.
+- **Fixture difficulty**: comes straight from FPL's own Fixture Difficulty
+  Rating (FDR, 1-5) -- the `team_h_difficulty`/`team_a_difficulty` fields
+  the live fixtures API already returns, pivoted into a per-team lookup by
+  `fpl_predictor.data_sources.fpl_api.fixtures_long_by_team`. No separate
+  team-strength model or historical results data needed, and it's always
+  as current as the live API itself.
 - **Features**: rolling/lag stats (points, minutes, bps, ICT index,
   expected goals/assists where available) computed strictly from *past*
-  gameweeks, plus fixture difficulty (opponent strength, home/away) and
-  defensive-contribution volume (tackles/clearances/blocks/interceptions/
-  recoveries, feeding the 2025/26 defensive-contribution scoring rule).
-  See `fpl_predictor/features.py`.
+  gameweeks, plus fixture difficulty and home/away, and defensive-
+  contribution volume (tackles/clearances/blocks/interceptions/recoveries,
+  feeding the 2025/26 defensive-contribution scoring rule). See
+  `fpl_predictor/features.py`.
 - **Model**: a separate LightGBM regressor per position (GKP/DEF/MID/FWD),
   since clean sheets matter for defenders and goals matter for attackers,
   trained with a Tweedie objective (rather than plain L2) to match how
@@ -92,7 +89,7 @@ switch between live data and offline demo data. Tabs:
 - **Player Explorer** — filterable/sortable table of every player's
   predicted points and points-per-million across upcoming gameweeks.
 - **Model Insights** — per-position validation error and feature
-  importance, plus the underlying team-strength ratings.
+  importance, plus the upcoming gameweek's fixture difficulty ratings.
 - **Backtest** — walk-forward validation of the whole pipeline against
   already-completed gameweeks: actual points scored by the model's picks
   vs. a naive baseline, per-gameweek error and rank correlation.
@@ -119,10 +116,9 @@ access and is fully deterministic.
 
 ```
 fpl_predictor/
-  config.py              constants, team-name aliases
+  config.py              constants
   data_sources/
-    fpl_api.py            live FPL API fetch + disk cache
-    team_strength.py       Elo ratings from historical results
+    fpl_api.py            live FPL API fetch + disk cache + fixture-difficulty lookup
   features.py             rolling/lag feature engineering
   model.py                per-position LightGBM training + tuning
   forecast.py              project models onto future gameweeks
@@ -131,18 +127,10 @@ fpl_predictor/
   backtest.py               walk-forward validation over past gameweeks
 app.py                     Streamlit web interface
 tests/                     pytest suite (offline, uses demo data)
-all-euro-data-*.csv        historical PL results (football-data.co.uk)
 ```
 
 ## Limitations / next steps
 
-- The Elo model only uses final scores; incorporating underlying-stats
-  (xG) team ratings would sharpen fixture difficulty further.
-- The bundled historical results only go up to the 2024-25 season. Drop a
-  newer `all-euro-data-YYYY-YYYY.csv` (same football-data.co.uk "E0"
-  format) into the repo root and it's picked up automatically -- no code
-  changes needed -- so Elo ratings can reflect promoted/relegated clubs
-  and the latest squad strength once a season file is available.
 - Playing-probability comes straight from the FPL API's own status/news
   field; a dedicated minutes-prediction model would improve rotation risk
   handling for bench players.
@@ -166,3 +154,8 @@ all-euro-data-*.csv        historical PL results (football-data.co.uk)
   transfer strategy -- those are different, also-useful questions.
 - The Tweedie variance power (1.5) is a fixed, commonly-used default, not
   itself tuned per position.
+- FPL's FDR is a coarse 1-5 rating set by FPL's own analysts; a model-
+  derived team-strength signal (e.g. from underlying stats) could be more
+  granular, at the cost of needing separate data and upkeep -- the FDR
+  approach was chosen deliberately over that trade-off for simplicity and
+  staying automatically current with no extra data source to maintain.

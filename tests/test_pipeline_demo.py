@@ -29,6 +29,15 @@ def test_model_trains_for_every_position(result):
         assert pm.n_train_rows > 0
 
 
+def test_fixture_difficulty_feature_is_populated_and_varies(result):
+    # FPL's own FDR (1-5), joined in per (team, gameweek, opponent) --
+    # replaces the old Elo/historical-CSV team-strength model entirely.
+    assert "fixture_difficulty" in result.feat_df.columns
+    assert "fixture_difficulty" in result.feature_cols
+    assert result.feat_df["fixture_difficulty"].between(1, 5).all()
+    assert result.feat_df["fixture_difficulty"].nunique() > 1
+
+
 def test_defensive_contribution_features_are_picked_up(result):
     # tackles/CBI/recoveries are in the demo history -> defensive_actions
     # should get built and its rolling stats should make it into the

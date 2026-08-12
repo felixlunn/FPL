@@ -16,7 +16,6 @@ import pandas as pd
 
 from fpl_predictor.config import MAX_FPL_GW, SEED
 from fpl_predictor.data_sources import fpl_api
-from fpl_predictor.data_sources.team_strength import EloRatings, compute_elo_ratings
 from fpl_predictor.features import create_feature_frame, feature_columns_present
 from fpl_predictor.forecast import apply_playing_probability, predict_cold_start_gameweek, predict_future_gameweeks
 from fpl_predictor.model import TrainedModel, train_model
@@ -125,7 +124,6 @@ def fetch_live_data(max_workers: int = 12, ttl_seconds: int = 3600, progress_cb=
 @dataclass
 class PipelineResult:
     data: DataBundle
-    elo_ratings: EloRatings
     feat_df: pd.DataFrame
     feature_cols: list
     trained_model: TrainedModel
@@ -161,14 +159,13 @@ def run_pipeline(data: DataBundle) -> PipelineResult:
     first completed gameweek of the next), predictions fall back to a
     last-season-form + fixture-difficulty baseline instead of failing.
     """
-    elo_ratings = compute_elo_ratings()
-    feat_df = create_feature_frame(data.history_df, data.players_df, data.fixtures_df, elo_ratings)
+    feat_df = create_feature_frame(data.history_df, data.players_df, data.fixtures_df)
 
     target_gw = _resolve_target_gw(data, feat_df)
     last_completed_gw = int(feat_df["round"].max()) if not feat_df.empty else 0
 
     if target_gw is None:
-        return PipelineResult(data, elo_ratings, feat_df, [], TrainedModel([]), pd.DataFrame(), [], last_completed_gw, [], mode="season_over")
+        return PipelineResult(data, feat_df, [], TrainedModel([]), pd.DataFrame(), [], last_completed_gw, [], mode="season_over")
 
     gw_cols = [f"GW{target_gw}_Points"]
 
@@ -176,19 +173,19 @@ def run_pipeline(data: DataBundle) -> PipelineResult:
         # No (player, gameweek) history to train on yet -- typically the
         # gap between seasons. Real players, heuristic baseline.
         if data.players_df.empty:
-            return PipelineResult(data, elo_ratings, feat_df, [], TrainedModel([]), pd.DataFrame(), gw_cols, last_completed_gw, [target_gw], mode="no_data")
-        pred_df = predict_cold_start_gameweek(data.players_df, data.past_seasons_df, data.fixtures_df, elo_ratings, target_gw)
+            return PipelineResult(data, feat_df, [], TrainedModel([]), pd.DataFrame(), gw_cols, last_completed_gw, [target_gw], mode="no_data")
+        pred_df = predict_cold_start_gameweek(data.players_df, data.past_seasons_df, data.fixtures_df, target_gw)
         trained_model, feature_cols, mode = TrainedModel([]), [], "cold_start"
     else:
         feature_cols = feature_columns_present(feat_df)
         trained_model = train_model(feat_df, feature_cols)
-        pred_df = predict_future_gameweeks(trained_model, feat_df, data.players_df, data.fixtures_df, elo_ratings, [target_gw])
+        pred_df = predict_future_gameweeks(trained_model, feat_df, data.players_df, data.fixtures_df, [target_gw])
         mode = "trained"
 
     if not pred_df.empty:
         pred_df = apply_playing_probability(pred_df, data.players_df, gw_cols)
 
-    return PipelineResult(data, elo_ratings, feat_df, feature_cols, trained_model, pred_df, gw_cols, last_completed_gw, [target_gw], mode=mode)
+    return PipelineResult(data, feat_df, feature_cols, trained_model, pred_df, gw_cols, last_completed_gw, [target_gw], mode=mode)
 
 
 # ---------------------------------------------------------------------------
@@ -222,16 +219,29 @@ def build_demo_data(n_gws: int = 10, n_future_gws: int = 5, seed: int = SEED) ->
     players_df["playing_prob"] = 1.0
     teams_df = pd.DataFrame({"id": range(1, len(_DEMO_TEAMS) + 1), "name": _DEMO_TEAMS})
 
-    # Round-robin-ish fixture list: each gameweek, pair teams up.
-    fixtures_rows, event = [], 1
+    # Round-robin-ish fixture list: each gameweek, pair teams up, with a
+    # random FPL-style 1-5 difficulty rating per side of each fixture.
+    # "schedule" also drives each player's per-gameweek history below, so
+    # the two stay internally consistent (a player's recorded opponent
+    # really is who their team played that gameweek) -- important now that
+    # feature engineering joins fixture difficulty on (team, gw, opponent).
+    fixtures_rows = []
     all_gws = n_gws + n_future_gws
     team_ids = list(range(1, len(_DEMO_TEAMS) + 1))
+    schedule: dict[int, dict[int, tuple[int, bool, int]]] = {tid: {} for tid in team_ids}
     fid = 1
     for gw in range(1, all_gws + 1):
         shuffled = team_ids[:]
         rng.shuffle(shuffled)
         for i in range(0, len(shuffled) - 1, 2):
-            fixtures_rows.append({"id": fid, "event": gw, "team_h": shuffled[i], "team_a": shuffled[i + 1]})
+            home, away = shuffled[i], shuffled[i + 1]
+            home_difficulty, away_difficulty = int(rng.integers(1, 6)), int(rng.integers(1, 6))
+            fixtures_rows.append({
+                "id": fid, "event": gw, "team_h": home, "team_a": away,
+                "team_h_difficulty": home_difficulty, "team_a_difficulty": away_difficulty,
+            })
+            schedule[home][gw] = (away, True, home_difficulty)
+            schedule[away][gw] = (home, False, away_difficulty)
             fid += 1
     fixtures_df = pd.DataFrame(fixtures_rows)
 
@@ -239,8 +249,13 @@ def build_demo_data(n_gws: int = 10, n_future_gws: int = 5, seed: int = SEED) ->
     for p in players:
         q = p["_quality"]
         for gw in range(1, n_gws + 1):
+            opponent, was_home, difficulty = schedule[p["team"]][gw]
+            # Harder fixtures (higher FDR) suppress points a little, so the
+            # synthetic data actually carries a fixture-difficulty signal
+            # for the model (and the backtest) to pick up on.
+            difficulty_mult = 1.0 + (3 - difficulty) * 0.08
             minutes = int(rng.choice([0, 0, 60, 90, 90], p=[0.1, 0.1, 0.2, 0.3, 0.3]))
-            pts_mean = 2 + q * 6 * (minutes / 90.0)
+            pts_mean = (2 + q * 6 * (minutes / 90.0)) * difficulty_mult
             pts = max(0, int(round(rng.normal(pts_mean, 2.0))))
             history_rows.append({
                 "player_id": p["id"], "round": gw, "total_points": pts, "minutes": minutes,
@@ -256,7 +271,7 @@ def build_demo_data(n_gws: int = 10, n_future_gws: int = 5, seed: int = SEED) ->
                 "tackles": int(rng.poisson(1.5 if p["element_type"] in (2, 3) else 0.3)) if minutes > 0 else 0,
                 "clearances_blocks_interceptions": int(rng.poisson(2.5 if p["element_type"] == 2 else 1.0)) if minutes > 0 else 0,
                 "recoveries": int(rng.poisson(3.0 if p["element_type"] in (2, 3) else 1.0)) if minutes > 0 else 0,
-                "was_home": bool(gw % 2 == 0), "opponent_team": ((p["team"] + gw) % len(_DEMO_TEAMS)) + 1,
+                "was_home": was_home, "opponent_team": opponent,
                 "kickoff_time": f"2025-{(gw % 12) + 1:02d}-01T15:00:00Z",
             })
     history_df = pd.DataFrame(history_rows)
