@@ -14,7 +14,7 @@ from fpl_predictor.config import MAX_PER_TEAM, MAX_SQUAD_COST, POS_COUNTS
 @pytest.fixture(scope="module")
 def result():
     data = build_demo_data(n_gws=10, n_future_gws=4, seed=1)
-    return run_pipeline(data, n_future_gws=4)
+    return run_pipeline(data)
 
 
 def test_feature_frame_has_no_label_leakage_columns_as_features(result):
@@ -23,17 +23,38 @@ def test_feature_frame_has_no_label_leakage_columns_as_features(result):
 
 
 def test_model_trains_for_every_position(result):
+    assert result.mode == "trained"
     assert set(result.trained_model.positions.keys()) == {1, 2, 3, 4}
     for pm in result.trained_model.positions.values():
         assert pm.n_train_rows > 0
 
 
-def test_predictions_cover_future_gameweeks(result):
+def test_predictions_target_exactly_one_upcoming_gameweek(result):
     assert not result.pred_df.empty
-    for col in result.gw_cols:
-        assert col in result.pred_df.columns
+    # The app always predicts a single gameweek -- the next unplayed one.
+    assert len(result.gw_cols) == 1
+    assert len(result.future_gws) == 1
+    assert result.future_gws[0] == result.last_completed_gw + 1
+    assert result.gw_cols[0] in result.pred_df.columns
     assert "pred_points_total_adj" in result.pred_df.columns
     assert (result.pred_df["pred_points_total_adj"] >= 0).all()
+
+
+def test_cold_start_mode_when_no_current_season_history_exists():
+    """The gap every season between the final ball of one campaign and the
+    first completed gameweek of the next: no (player, gameweek) history to
+    train on, but real players should still get sensible predictions
+    rather than the pipeline giving up.
+    """
+    data = build_demo_data(n_gws=0, n_future_gws=3, seed=2)
+    result = run_pipeline(data)
+    assert result.mode == "cold_start"
+    assert result.feat_df.empty
+    assert len(result.gw_cols) == 1
+    assert not result.pred_df.empty
+    assert result.pred_df["web_name"].notna().all()
+    assert (result.pred_df["pred_points_total_adj"] >= 0).all()
+    assert result.pred_df["pred_points_total_adj"].sum() > 0
 
 
 def test_optimal_squad_respects_all_constraints(result):

@@ -34,11 +34,23 @@ results (Elo) ──┘
   Hyperparameters are chosen by walk-forward (`TimeSeriesSplit`)
   cross-validation, never on future gameweeks, so validation MAE reflects
   real predictive skill (`fpl_predictor/model.py`).
-- **Forecasting**: predictions are projected onto specific future
-  gameweeks using the *actual* fixture list, correctly handling blank
-  gameweeks (no fixture → 0 points) and double gameweeks (two fixtures →
-  points summed), then scaled by each player's estimated probability of
-  playing (`fpl_predictor/forecast.py`).
+- **Forecasting**: the app always predicts exactly one gameweek -- the
+  next one that hasn't been played yet, determined from the FPL API's own
+  `is_next` event flag (not by guessing from completed-gameweek history,
+  which breaks at the start of a season). Predictions use the *actual*
+  fixture list, correctly handling blank gameweeks (no fixture → 0
+  points) and double gameweeks (two fixtures → points summed), then are
+  scaled by each player's estimated probability of playing
+  (`fpl_predictor/forecast.py`).
+- **New-season cold start**: every season has a gap between the final
+  ball of one campaign and the first completed gameweek of the next --
+  during that window there is no (player, gameweek) data yet to train a
+  model on. Rather than falling back to fake data, the app detects this
+  and switches to a baseline that uses each player's last-season per-90
+  output (from the FPL API's `history_past`) scaled by fixture difficulty
+  and playing probability -- still real players, just a simpler model
+  until GW1 results land, at which point full model training resumes
+  automatically.
 - **Optimization**: squad selection, starting XI, and transfer
   suggestions are all solved as integer linear programs (PuLP/CBC)
   against the real FPL rules (£100m budget, 15-man squad, max 3 per club,
@@ -56,8 +68,9 @@ streamlit run app.py
 
 Open the URL Streamlit prints (defaults to http://localhost:8501).
 
-The sidebar lets you pick a gameweek, set your budget and free transfers,
-and switch between live data and offline demo data. Tabs:
+The app always targets the single upcoming gameweek (shown in the
+sidebar); use the sidebar to set your budget and free transfers, and to
+switch between live data and offline demo data. Tabs:
 
 - **Optimal Squad** — the best possible 15 under budget/rules, plus the
   optimal starting XI, captain, and bench for the selected gameweek.
@@ -110,8 +123,17 @@ all-euro-data-*.csv        historical PL results (football-data.co.uk)
 
 - The Elo model only uses final scores; incorporating underlying-stats
   (xG) team ratings would sharpen fixture difficulty further.
+- The bundled historical results only go up to the 2024-25 season. Drop a
+  newer `all-euro-data-YYYY-YYYY.csv` (same football-data.co.uk "E0"
+  format) into the repo root and it's picked up automatically -- no code
+  changes needed -- so Elo ratings can reflect promoted/relegated clubs
+  and the latest squad strength once a season file is available.
 - Playing-probability comes straight from the FPL API's own status/news
   field; a dedicated minutes-prediction model would improve rotation risk
   handling for bench players.
+- The cold-start (pre-season) baseline is a simple heuristic, not a
+  learned model -- it's meant to keep the app useful with real players
+  before any current-season data exists, not to match the trained
+  model's accuracy.
 - Transfer search caps at a small number of transfers per run (adjustable
   in the UI) since it re-solves the full ILP per candidate transfer count.

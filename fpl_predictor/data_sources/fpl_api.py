@@ -95,6 +95,21 @@ def players_and_teams_from_bootstrap(bootstrap: dict) -> tuple[pd.DataFrame, pd.
     return players[cols].copy(), teams
 
 
+def next_gameweek_from_bootstrap(bootstrap: dict) -> tuple[int | None, int | None]:
+    """(current_gw, next_gw) from the API's own event flags -- this is the
+    authoritative source for "what gameweek are we predicting for", and
+    works even when zero gameweeks have been played yet (pre-season/new
+    season), unlike inferring it from completed-gameweek history.
+    """
+    events = bootstrap.get("events", []) if bootstrap else []
+    current = next((e["id"] for e in events if e.get("is_current")), None)
+    nxt = next((e["id"] for e in events if e.get("is_next")), None)
+    if nxt is None:
+        unfinished = [e["id"] for e in events if not e.get("finished")]
+        nxt = min(unfinished) if unfinished else None
+    return current, nxt
+
+
 def fixtures_df_from_json(fixtures_json: list) -> pd.DataFrame:
     if not fixtures_json:
         return pd.DataFrame()

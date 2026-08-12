@@ -88,6 +88,74 @@ def predict_future_gameweeks(
     return result.sort_values("pred_points_total", ascending=False).reset_index(drop=True)
 
 
+_COLD_START_DEFAULT_PER90 = {1: 2.0, 2: 2.4, 3: 2.6, 4: 2.6}  # GKP, DEF, MID, FWD
+
+
+def predict_cold_start_gameweek(
+    players_df: pd.DataFrame,
+    past_seasons_df: pd.DataFrame,
+    fixtures_df: pd.DataFrame,
+    elo_ratings: EloRatings,
+    target_gw: int,
+) -> pd.DataFrame:
+    """Predict a single gameweek with zero current-season history to learn
+    from -- the situation every season between the final ball of one
+    campaign and the first completed gameweek of the next. There's no
+    (player, gameweek) -> points data yet to train a model on, so instead
+    of refusing to show real players, fall back to each player's own
+    last-season per-90 output (from the FPL API's ``history_past``),
+    scaled by an assumed ~68 minutes when selected and by fixture
+    difficulty (via Elo) -- then the usual playing-probability adjustment
+    is layered on top by the caller, exactly as for the trained-model path.
+    """
+    if players_df.empty:
+        return pd.DataFrame()
+    col = f"GW{target_gw}_Points"
+
+    if past_seasons_df is not None and not past_seasons_df.empty:
+        latest_past = past_seasons_df.sort_values("season_name").groupby("player_id").tail(1).set_index("player_id")
+    else:
+        latest_past = pd.DataFrame(columns=["total_points", "minutes"])
+
+    def _per90(row) -> float:
+        pid = row["id"]
+        if pid in latest_past.index:
+            mins = float(latest_past.loc[pid].get("minutes", 0) or 0)
+            pts = float(latest_past.loc[pid].get("total_points", 0) or 0)
+            if mins >= 180:  # enough minutes last season for the rate to mean anything
+                return pts / mins * 90.0
+        return _COLD_START_DEFAULT_PER90.get(row["element_type"], 2.0)
+
+    base = players_df.copy()
+    base["_per90"] = base.apply(_per90, axis=1)
+    base["_baseline_pts"] = base["_per90"] * (68.0 / 90.0)  # assumed minutes when selected
+
+    team_id_to_name = base.drop_duplicates("team").set_index("team")["team_name"].to_dict()
+    fixtures_lookup = _fixtures_by_team_and_gw(fixtures_df)
+
+    points = pd.Series(0.0, index=base.index)
+    for team_id, team_rows in base.groupby("team"):
+        fixtures_this_gw = fixtures_lookup.get(team_id, {}).get(target_gw, [])
+        if not fixtures_this_gw:
+            continue
+        team_name = canonical_team_name(team_id_to_name.get(team_id, ""))
+        team_strength = elo_ratings.strength(team_name)
+        fixture_mult_total = 0.0
+        for opp_id, was_home in fixtures_this_gw:
+            opp_name = canonical_team_name(team_id_to_name.get(opp_id, ""))
+            opp_strength = elo_ratings.strength(opp_name)
+            mult = 1.0 + max(-0.3, min(0.3, (team_strength - opp_strength) / 400.0))
+            mult *= 1.05 if was_home else 0.97
+            fixture_mult_total += mult
+        points.loc[team_rows.index] = team_rows["_baseline_pts"] * fixture_mult_total
+
+    out = base[["id", "web_name", "team_name", "element_type", "now_cost"]].rename(columns={"id": "player_id"}).copy()
+    out["now_cost"] = out["now_cost"] / 10.0
+    out[col] = points.to_numpy()
+    out["pred_points_total"] = out[col]
+    return out.sort_values("pred_points_total", ascending=False).reset_index(drop=True)
+
+
 def apply_playing_probability(pred_df: pd.DataFrame, players_df: pd.DataFrame, gw_cols: list[str]) -> pd.DataFrame:
     """Scale each per-gameweek prediction (and the total) by a player's
     estimated probability of actually playing, so an injured star doesn't

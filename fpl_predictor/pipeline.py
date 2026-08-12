@@ -18,7 +18,7 @@ from fpl_predictor.config import MAX_FPL_GW, SEED
 from fpl_predictor.data_sources import fpl_api
 from fpl_predictor.data_sources.team_strength import EloRatings, compute_elo_ratings
 from fpl_predictor.features import create_feature_frame, feature_columns_present
-from fpl_predictor.forecast import apply_playing_probability, predict_future_gameweeks
+from fpl_predictor.forecast import apply_playing_probability, predict_cold_start_gameweek, predict_future_gameweeks
 from fpl_predictor.model import TrainedModel, train_model
 
 
@@ -41,6 +41,9 @@ class DataBundle:
     teams_df: pd.DataFrame
     fixtures_df: pd.DataFrame
     history_df: pd.DataFrame
+    past_seasons_df: pd.DataFrame = field(default_factory=pd.DataFrame)
+    next_gw: int | None = None
+    current_gw: int | None = None
     meta: dict = field(default_factory=dict)
 
 
@@ -55,22 +58,30 @@ def fetch_live_data(max_workers: int = 12, ttl_seconds: int = 3600, progress_cb=
 
     players_df, teams_df = fpl_api.players_and_teams_from_bootstrap(boot)
     players_df["playing_prob"] = players_df.apply(lambda r: assign_playing_probability(r.get("status", "a"), r.get("news", "")), axis=1)
+    current_gw, next_gw = fpl_api.next_gameweek_from_bootstrap(boot)
 
     fixtures_json, fx_meta = fpl_api.fetch_fixtures(ttl_seconds=ttl_seconds)
     fixtures_df = fpl_api.fixtures_df_from_json(fixtures_json or [])
 
-    rows = []
+    rows, past_rows = [], []
     failed = 0
 
     def _fetch_one(pid):
         data, _ = fpl_api.fetch_player_history(pid, ttl_seconds=24 * 3600)
-        out = []
+        hist_out, past_out = [], []
         if data:
             for gw in data.get("history", []):
                 r = dict(gw)
                 r["player_id"] = pid
-                out.append(r)
-        return out
+                hist_out.append(r)
+            # history_past carries season-level (not per-gameweek) totals for
+            # prior seasons -- the only per-player signal the live API gives
+            # us before this season has any completed gameweeks of its own.
+            for season in data.get("history_past", []):
+                r = dict(season)
+                r["player_id"] = pid
+                past_out.append(r)
+        return hist_out, past_out
 
     player_ids = players_df["id"].tolist()
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -79,7 +90,9 @@ def fetch_live_data(max_workers: int = 12, ttl_seconds: int = 3600, progress_cb=
         for fut in concurrent.futures.as_completed(futures):
             done += 1
             try:
-                rows.extend(fut.result())
+                hist_out, past_out = fut.result()
+                rows.extend(hist_out)
+                past_rows.extend(past_out)
             except Exception:
                 failed += 1
             if progress_cb:
@@ -88,6 +101,7 @@ def fetch_live_data(max_workers: int = 12, ttl_seconds: int = 3600, progress_cb=
     history_df = pd.DataFrame(rows)
     if not history_df.empty and "round" in history_df.columns:
         history_df["round"] = history_df["round"].astype(int)
+    past_seasons_df = pd.DataFrame(past_rows)
 
     meta = {
         "ok": True,
@@ -96,8 +110,10 @@ def fetch_live_data(max_workers: int = 12, ttl_seconds: int = 3600, progress_cb=
         "n_players": len(players_df),
         "n_history_rows": len(history_df),
         "n_players_failed": failed,
+        "next_gw": next_gw,
+        "current_gw": current_gw,
     }
-    return DataBundle(players_df, teams_df, fixtures_df, history_df, meta=meta)
+    return DataBundle(players_df, teams_df, fixtures_df, history_df, past_seasons_df, next_gw, current_gw, meta=meta)
 
 
 @dataclass
@@ -111,32 +127,62 @@ class PipelineResult:
     gw_cols: list
     last_completed_gw: int
     future_gws: list
+    mode: str = "trained"  # "trained" | "cold_start" | "season_over" | "no_data"
 
 
-def run_pipeline(data: DataBundle, n_future_gws: int | None = None) -> PipelineResult:
-    """Build features, train the per-position models, and project points
-    onto upcoming gameweeks -- everything the UI needs, in one call.
+def _resolve_target_gw(data: DataBundle, feat_df: pd.DataFrame) -> int | None:
+    """The single gameweek to predict for. Prefer the FPL API's own
+    is_next/is_current flags (authoritative, and correct even pre-season
+    when there's no completed-gameweek history to infer from); fall back
+    to "one past the last completed gameweek" for data sources that don't
+    carry that flag (e.g. the synthetic demo dataset).
+    """
+    if data.next_gw is not None:
+        return data.next_gw
+    last_completed = int(feat_df["round"].max()) if not feat_df.empty else 0
+    max_fixture_gw = int(data.fixtures_df["event"].max()) if not data.fixtures_df.empty else MAX_FPL_GW
+    candidate = last_completed + 1
+    return candidate if candidate <= max_fixture_gw else None
+
+
+def run_pipeline(data: DataBundle) -> PipelineResult:
+    """Build features, train the per-position models, and predict the
+    single upcoming gameweek -- everything the UI needs, in one call.
+
+    Always targets exactly one gameweek: the next one that hasn't been
+    played. When that gameweek has no current-season history to learn
+    from yet (every season, between the last ball of one campaign and the
+    first completed gameweek of the next), predictions fall back to a
+    last-season-form + fixture-difficulty baseline instead of failing.
     """
     elo_ratings = compute_elo_ratings()
     feat_df = create_feature_frame(data.history_df, data.players_df, data.fixtures_df, elo_ratings)
+
+    target_gw = _resolve_target_gw(data, feat_df)
+    last_completed_gw = int(feat_df["round"].max()) if not feat_df.empty else 0
+
+    if target_gw is None:
+        return PipelineResult(data, elo_ratings, feat_df, [], TrainedModel([]), pd.DataFrame(), [], last_completed_gw, [], mode="season_over")
+
+    gw_cols = [f"GW{target_gw}_Points"]
+
     if feat_df.empty:
-        return PipelineResult(data, elo_ratings, feat_df, [], TrainedModel([]), pd.DataFrame(), [], 0, [])
+        # No (player, gameweek) history to train on yet -- typically the
+        # gap between seasons. Real players, heuristic baseline.
+        if data.players_df.empty:
+            return PipelineResult(data, elo_ratings, feat_df, [], TrainedModel([]), pd.DataFrame(), gw_cols, last_completed_gw, [target_gw], mode="no_data")
+        pred_df = predict_cold_start_gameweek(data.players_df, data.past_seasons_df, data.fixtures_df, elo_ratings, target_gw)
+        trained_model, feature_cols, mode = TrainedModel([]), [], "cold_start"
+    else:
+        feature_cols = feature_columns_present(feat_df)
+        trained_model = train_model(feat_df, feature_cols)
+        pred_df = predict_future_gameweeks(trained_model, feat_df, data.players_df, data.fixtures_df, elo_ratings, [target_gw])
+        mode = "trained"
 
-    feature_cols = feature_columns_present(feat_df)
-    trained_model = train_model(feat_df, feature_cols)
-
-    last_completed_gw = int(feat_df["round"].max())
-    max_fixture_gw = int(data.fixtures_df["event"].max()) if not data.fixtures_df.empty else MAX_FPL_GW
-    if n_future_gws is None:
-        n_future_gws = max(0, max_fixture_gw - last_completed_gw)
-    future_gws = list(range(last_completed_gw + 1, last_completed_gw + 1 + n_future_gws))
-
-    pred_df = predict_future_gameweeks(trained_model, feat_df, data.players_df, data.fixtures_df, elo_ratings, future_gws)
-    gw_cols = [f"GW{g}_Points" for g in future_gws]
     if not pred_df.empty:
         pred_df = apply_playing_probability(pred_df, data.players_df, gw_cols)
 
-    return PipelineResult(data, elo_ratings, feat_df, feature_cols, trained_model, pred_df, gw_cols, last_completed_gw, future_gws)
+    return PipelineResult(data, elo_ratings, feat_df, feature_cols, trained_model, pred_df, gw_cols, last_completed_gw, [target_gw], mode=mode)
 
 
 # ---------------------------------------------------------------------------
@@ -206,4 +252,7 @@ def build_demo_data(n_gws: int = 10, n_future_gws: int = 5, seed: int = SEED) ->
     history_df = pd.DataFrame(history_rows)
 
     meta = {"ok": True, "bootstrap_source": "demo", "fixtures_source": "demo", "n_players": len(players_df), "n_history_rows": len(history_df), "n_players_failed": 0, "demo": True}
-    return DataBundle(players_df.drop(columns=["_quality"]), teams_df, fixtures_df, history_df, meta=meta)
+    return DataBundle(
+        players_df.drop(columns=["_quality"]), teams_df, fixtures_df, history_df,
+        past_seasons_df=pd.DataFrame(), next_gw=n_gws + 1, current_gw=n_gws, meta=meta,
+    )

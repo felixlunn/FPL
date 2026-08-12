@@ -110,21 +110,34 @@ if data_meta.get("demo") or data_meta.get("fallback_reason"):
 else:
     st.sidebar.success(f"Live data loaded ({data_meta.get('n_players', 0)} players, source: {data_meta.get('bootstrap_source')})")
 
-if result.feat_df.empty:
-    st.error("No data available to build features or train a model. Try refreshing, or switch to demo data.")
+if result.mode == "season_over":
+    st.error("No upcoming gameweek found -- the season may be over, or fixture data is unavailable.")
+    st.stop()
+if result.mode == "no_data":
+    st.error("No player data available at all. Try refreshing, or switch to demo data.")
     st.stop()
 
-gw_options = result.future_gws
-gw = st.sidebar.select_slider("Gameweek to optimise for", options=gw_options, value=gw_options[0]) if gw_options else None
-gw_col = f"GW{gw}_Points" if gw else None
+# The app always predicts exactly one gameweek: the next one that hasn't
+# been played yet (per the FPL API's own is_next flag where available).
+gw = result.future_gws[0]
+gw_col = result.gw_cols[0]
 
 st.sidebar.markdown("---")
-st.sidebar.metric("Model MAE (points/player, avg)", f"{result.trained_model.overall_mae:.2f}")
-st.sidebar.caption(f"Trained through GW{result.last_completed_gw} • projecting GW{gw_options[0] if gw_options else '-'}-{gw_options[-1] if gw_options else '-'}")
+st.sidebar.metric("Predicting", f"Gameweek {gw}")
+if result.mode == "trained":
+    st.sidebar.metric("Model MAE (points/player, avg)", f"{result.trained_model.overall_mae:.2f}")
+    st.sidebar.caption(f"Trained on {result.last_completed_gw} completed gameweek(s) this season.")
+elif result.mode == "cold_start":
+    st.sidebar.info(
+        "**Early-season baseline mode.** No gameweeks have been played yet this season, so there's nothing to "
+        "train a model on -- predictions use each player's last-season per-90 output, scaled by fixture difficulty "
+        "and playing probability, instead.",
+        icon="ℹ️",
+    )
 
 pred_df = result.pred_df
-if pred_df.empty or gw_col is None:
-    st.error("No upcoming fixtures found to predict -- the season may be over, or fixture data is unavailable.")
+if pred_df.empty:
+    st.error(f"No predictions available for GW{gw} (e.g. a blank gameweek with no fixtures). Try refreshing.")
     st.stop()
 
 # ---------------------------------------------------------------------------
@@ -144,7 +157,7 @@ with tab_optimal:
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Squad cost", f"£{squad['now_cost'].sum():.1f}m", help=f"Budget: £{budget:.0f}m")
         c2.metric(f"Predicted GW{gw} points (XI)", f"{lineup[gw_col].sum():.1f}")
-        c3.metric(f"Total pred. points (GW{gw_options[0]}-{gw_options[-1]})", f"{squad['pred_points_total'].sum():.1f}")
+        c3.metric(f"Predicted GW{gw} points (full squad)", f"{squad[gw_col].sum():.1f}")
         c4.metric("Captain", f"{captain['web_name']} ({captain[gw_col]*2:.1f}p)")
 
         left, right = st.columns([3, 2])
@@ -215,10 +228,10 @@ with tab_transfers:
         if plan is None:
             st.error("No feasible transfer plan found.")
         elif plan.n_transfers == 0:
-            st.success("No transfers recommended — your squad is already optimal (or close to it) for the projection horizon.")
+            st.success(f"No transfers recommended — your squad is already optimal (or close to it) for GW{gw}.")
         else:
             hit_note = f" (−{plan.hit_cost:.0f} pt hit)" if plan.hit_cost else ""
-            st.success(f"Recommended: {plan.n_transfers} transfer(s){hit_note} — net gain {plan.net_points - my_squad_df['pred_points_total_adj'].sum():.1f} pts over the projection horizon")
+            st.success(f"Recommended: {plan.n_transfers} transfer(s){hit_note} — net gain {plan.net_points - my_squad_df['pred_points_total_adj'].sum():.1f} pts for GW{gw}")
             c1, c2 = st.columns(2)
             with c1:
                 st.markdown("**Out**")
@@ -255,26 +268,34 @@ with tab_explorer:
 
 # --- Model insights ----------------------------------------------------------
 with tab_model:
-    st.caption("Per-position LightGBM models, tuned via walk-forward (time-series) cross-validation.")
-    mcols = st.columns(4)
-    for col, (pos_id, pos_label) in zip(mcols, POS_MAP.items()):
-        pm = result.trained_model.positions.get(pos_id)
-        with col:
-            if pm is None:
-                st.metric(pos_label, "n/a")
-            else:
-                mae_display = f"{pm.mae:.2f}" if pm.mae == pm.mae else "n/a"  # NaN check
-                st.metric(f"{pos_label} MAE", mae_display, help=f"{pm.n_train_rows} training rows")
+    if result.mode == "cold_start":
+        st.info(
+            "No LightGBM model is trained right now — there are zero completed gameweeks this season to learn "
+            "from yet. Predictions for the upcoming gameweek use last-season per-90 output scaled by fixture "
+            "difficulty instead; the full model kicks back in automatically once GW1 results are in.",
+            icon="ℹ️",
+        )
+    else:
+        st.caption("Per-position LightGBM models, tuned via walk-forward (time-series) cross-validation.")
+        mcols = st.columns(4)
+        for col, (pos_id, pos_label) in zip(mcols, POS_MAP.items()):
+            pm = result.trained_model.positions.get(pos_id)
+            with col:
+                if pm is None:
+                    st.metric(pos_label, "n/a")
+                else:
+                    mae_display = f"{pm.mae:.2f}" if pm.mae == pm.mae else "n/a"  # NaN check
+                    st.metric(f"{pos_label} MAE", mae_display, help=f"{pm.n_train_rows} training rows")
 
-    imp_cols = st.columns(2)
-    shown = 0
-    for pos_id, pos_label in POS_MAP.items():
-        pm = result.trained_model.positions.get(pos_id)
-        if pm is None or pm.feature_importance.empty:
-            continue
-        with imp_cols[shown % 2]:
-            st.plotly_chart(_importance_chart(pm.feature_importance, pos_label), use_container_width=True, theme="streamlit")
-        shown += 1
+        imp_cols = st.columns(2)
+        shown = 0
+        for pos_id, pos_label in POS_MAP.items():
+            pm = result.trained_model.positions.get(pos_id)
+            if pm is None or pm.feature_importance.empty:
+                continue
+            with imp_cols[shown % 2]:
+                st.plotly_chart(_importance_chart(pm.feature_importance, pos_label), use_container_width=True, theme="streamlit")
+            shown += 1
 
     with st.expander("Team strength (Elo) ratings, from historical results"):
         from fpl_predictor.data_sources.team_strength import build_team_strength_table
