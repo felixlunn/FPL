@@ -14,6 +14,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from fpl_predictor.backtest import BacktestReport, run_backtest
 from fpl_predictor.config import MAX_SQUAD_COST, POS_MAP
 from fpl_predictor.optimizer import build_starting_xi, find_optimal_squad, suggest_transfers, validate_squad
 from fpl_predictor.pipeline import PipelineResult, build_demo_data, fetch_live_data, run_pipeline
@@ -69,6 +70,30 @@ def _comparison_chart(your_pts: float, optimal_pts: float, gw: int) -> go.Figure
         marker_color=[SERIES_ORANGE, SERIES_BLUE], text=[f"{your_pts:.1f}", f"{optimal_pts:.1f}"], textposition="outside",
     ))
     fig.update_layout(title=f"Predicted points — GW{gw}", height=340, margin=dict(l=10, r=10, t=40, b=10), showlegend=False)
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def _cached_backtest(_data, min_train_gws: int, tune: bool, cache_key: str) -> BacktestReport:
+    # _data (leading underscore) is deliberately excluded from Streamlit's
+    # hashing -- cache_key (built from data_meta) stands in for it instead.
+    return run_backtest(_data, min_train_gws=min_train_gws, tune=tune)
+
+
+def _backtest_chart(df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=df["gw"], y=df["model_xi_points"], name="Model XI (actual pts)", marker_color=SERIES_BLUE))
+    fig.add_trace(go.Bar(x=df["gw"], y=df["baseline_xi_points"], name="Naive baseline XI (actual pts)", marker_color=SERIES_ORANGE))
+    fig.update_layout(barmode="group", title="Actual points scored per gameweek: model-picked XI vs. naive baseline",
+                       xaxis_title="Gameweek", yaxis_title="Points", height=380, margin=dict(l=10, r=10, t=40, b=10),
+                       legend=dict(orientation="h", yanchor="bottom", y=1.02))
+    return fig
+
+
+def _backtest_mae_chart(df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure(go.Bar(x=df["gw"], y=df["mae"], marker_color=SERIES_BLUE))
+    fig.update_layout(title="Prediction error per gameweek (lower is better)", xaxis_title="Gameweek",
+                       yaxis_title="MAE (points/player)", height=320, margin=dict(l=10, r=10, t=40, b=10), showlegend=False)
     return fig
 
 
@@ -143,8 +168,9 @@ if pred_df.empty:
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-tab_optimal, tab_mine, tab_transfers, tab_explorer, tab_model = st.tabs(
-    ["\U0001f3c6 Optimal Squad", "\U0001f464 My Squad", "\U0001f504 Transfers", "\U0001f50d Player Explorer", "\U0001f4ca Model Insights"]
+tab_optimal, tab_mine, tab_transfers, tab_explorer, tab_model, tab_backtest = st.tabs(
+    ["\U0001f3c6 Optimal Squad", "\U0001f464 My Squad", "\U0001f504 Transfers", "\U0001f50d Player Explorer",
+     "\U0001f4ca Model Insights", "\U0001f9ea Backtest"]
 )
 
 # --- Optimal squad ----------------------------------------------------------
@@ -300,3 +326,50 @@ with tab_model:
     with st.expander("Team strength (Elo) ratings, from historical results"):
         from fpl_predictor.data_sources.team_strength import build_team_strength_table
         st.dataframe(build_team_strength_table(result.elo_ratings), hide_index=True, use_container_width=True)
+
+# --- Backtest ------------------------------------------------------------
+with tab_backtest:
+    st.caption(
+        "Walk-forward validation: for each past gameweek, retrains using only earlier gameweeks (no lookahead), "
+        "predicts it, and compares the actual points scored by the model-picked XI against a naive baseline "
+        "(a squad picked by chasing the *previous* gameweek's top scorers). Both squads are freely rebuilt each "
+        "gameweek under budget -- this measures prediction/selection quality, not real transfer-limited strategy."
+    )
+    n_completed_gws = int(result.data.history_df["round"].nunique()) if not result.data.history_df.empty else 0
+    if n_completed_gws < 4:
+        st.info(
+            f"Only {n_completed_gws} completed gameweek(s) of history so far this season -- need at least 4 "
+            "to run a walk-forward backtest. Check back once more gameweeks have been played.",
+            icon="ℹ️",
+        )
+    else:
+        bt_col1, bt_col2, bt_col3 = st.columns(3)
+        min_train_gws = bt_col1.number_input("Warm-up gameweeks (min. training data)", min_value=1, max_value=max(1, n_completed_gws - 1), value=min(3, n_completed_gws - 1))
+        tune = bt_col2.checkbox("Full hyperparameter tuning (slower, more representative)", value=False)
+        run_bt = bt_col3.button("\U0001f9ea Run backtest", type="primary")
+
+        cache_key = f"{data_meta.get('bootstrap_source')}|{data_meta.get('n_history_rows')}|{n_completed_gws}|{min_train_gws}|{tune}"
+        if run_bt:
+            st.session_state["backtest_cache_key"] = cache_key
+        if st.session_state.get("backtest_cache_key") == cache_key:
+            with st.spinner("Replaying past gameweeks (retraining at each step)..."):
+                bt_report = _cached_backtest(result.data, int(min_train_gws), bool(tune), cache_key)
+            if not bt_report.per_gw:
+                st.warning("Backtest produced no comparable gameweeks (not enough history after the warm-up period).")
+            else:
+                bt_df = bt_report.as_dataframe()
+                advantage = bt_report.total_model_xi_points - bt_report.total_baseline_xi_points
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Overall MAE", f"{bt_report.overall_mae:.2f}")
+                m2.metric("Mean rank correlation", f"{bt_report.mean_spearman:.2f}", help="Spearman correlation between predicted and actual points each gameweek")
+                m3.metric("Model XI total (actual pts)", f"{bt_report.total_model_xi_points:.0f}")
+                m4.metric("vs. naive baseline", f"{advantage:+.0f}", help="Model-picked XI total minus naive-baseline XI total, summed over all backtested gameweeks")
+                st.plotly_chart(_backtest_chart(bt_df), use_container_width=True, theme="streamlit")
+                st.plotly_chart(_backtest_mae_chart(bt_df), use_container_width=True, theme="streamlit")
+                with st.expander("Per-gameweek detail"):
+                    st.dataframe(bt_df.rename(columns={
+                        "gw": "GW", "n_players": "Players", "mae": "MAE", "spearman_corr": "Rank corr.",
+                        "model_xi_points": "Model XI pts", "baseline_xi_points": "Baseline XI pts",
+                    }), hide_index=True, use_container_width=True)
+        else:
+            st.caption("Click **Run backtest** to compute this (retrains the model once per historical gameweek, so it takes a little while).")

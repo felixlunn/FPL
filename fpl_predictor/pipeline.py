@@ -112,6 +112,12 @@ def fetch_live_data(max_workers: int = 12, ttl_seconds: int = 3600, progress_cb=
         "n_players_failed": failed,
         "next_gw": next_gw,
         "current_gw": current_gw,
+        # Diagnostic: which raw per-gameweek stat fields the live API
+        # actually returned this run. The FPL API has occasionally renamed
+        # or added fields (e.g. the 2025/26 defensive-contribution stats);
+        # this makes it easy to confirm feature engineering is picking up
+        # what's really there instead of silently skipping a renamed field.
+        "history_columns": sorted(history_df.columns.tolist()) if not history_df.empty else [],
     }
     return DataBundle(players_df, teams_df, fixtures_df, history_df, past_seasons_df, next_gw, current_gw, meta=meta)
 
@@ -246,6 +252,10 @@ def build_demo_data(n_gws: int = 10, n_future_gws: int = 5, seed: int = SEED) ->
                 "influence": round(float(rng.normal(20 * q, 5)), 1),
                 "creativity": round(float(rng.normal(15 * q, 5)), 1),
                 "threat": round(float(rng.normal(15 * q, 5)), 1),
+                # Defenders/midfielders rack up more defensive actions than forwards.
+                "tackles": int(rng.poisson(1.5 if p["element_type"] in (2, 3) else 0.3)) if minutes > 0 else 0,
+                "clearances_blocks_interceptions": int(rng.poisson(2.5 if p["element_type"] == 2 else 1.0)) if minutes > 0 else 0,
+                "recoveries": int(rng.poisson(3.0 if p["element_type"] in (2, 3) else 1.0)) if minutes > 0 else 0,
                 "was_home": bool(gw % 2 == 0), "opponent_team": ((p["team"] + gw) % len(_DEMO_TEAMS)) + 1,
                 "kickoff_time": f"2025-{(gw % 12) + 1:02d}-01T15:00:00Z",
             })

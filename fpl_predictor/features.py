@@ -31,7 +31,22 @@ _ROLL_SOURCE_COLS = [
     "threat", "goals_scored", "assists", "clean_sheets", "goals_conceded",
     "saves", "expected_goals", "expected_assists", "expected_goal_involvements",
     "expected_goals_conceded", "bonus",
+    # Defensive-contribution scoring (introduced 2025/26): defenders get 2pts
+    # for 10+ CBIT (clearances+blocks+interceptions+tackles) in a match,
+    # midfielders/forwards for 12+ combined defensive actions. The API
+    # exposes the raw counting stats per gameweek; "defensive_actions" below
+    # sums whichever of them are present into a single CBIT-style proxy so
+    # the model can learn each player's run-rate against that threshold
+    # directly, without hardcoding the exact scoring rule (which may be
+    # tweaked season to season) -- if a field name below doesn't match what
+    # the live API actually returns, it's silently skipped, not an error;
+    # check a fetched DataBundle's history_df.columns to confirm/adjust.
+    "tackles", "clearances_blocks_interceptions", "recoveries", "defensive_contribution",
+    "defensive_actions",
 ]
+
+# Components summed into the "defensive_actions" CBIT proxy, see above.
+_DEFENSIVE_ACTION_COMPONENTS = ["tackles", "clearances_blocks_interceptions", "recoveries"]
 
 ROLLING_WINDOWS = (3, 6)
 
@@ -102,6 +117,10 @@ def create_feature_frame(
 
     sort_cols = ["player_id"] + (["round"] if "round" in df.columns else [])
     df = df.sort_values(sort_cols)
+
+    present_def_cols = [c for c in _DEFENSIVE_ACTION_COMPONENTS if c in df.columns]
+    if present_def_cols:
+        df["defensive_actions"] = df[present_def_cols].sum(axis=1)
 
     # --- rolling / lag features -------------------------------------------------
     g = df.groupby("player_id")

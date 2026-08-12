@@ -29,6 +29,14 @@ def test_model_trains_for_every_position(result):
         assert pm.n_train_rows > 0
 
 
+def test_defensive_contribution_features_are_picked_up(result):
+    # tackles/CBI/recoveries are in the demo history -> defensive_actions
+    # should get built and its rolling stats should make it into the
+    # feature set actually used for training (not silently dropped).
+    assert "defensive_actions" in result.feat_df.columns
+    assert any(c.startswith("defensive_actions_") for c in result.feature_cols)
+
+
 def test_predictions_target_exactly_one_upcoming_gameweek(result):
     assert not result.pred_df.empty
     # The app always predicts a single gameweek -- the next unplayed one.
