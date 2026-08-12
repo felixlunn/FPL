@@ -323,21 +323,9 @@ with tab_model:
                 st.plotly_chart(_importance_chart(pm.feature_importance, pos_label), use_container_width=True, theme="streamlit")
             shown += 1
 
-    with st.expander(f"Fixture difficulty ratings (FPL's own FDR) for GW{gw}"):
-        fx = result.data.fixtures_df
-        if fx.empty or "event" not in fx.columns:
-            st.caption("No fixture data available.")
-        else:
-            gw_fx = fx[fx["event"] == gw]
-            team_names = result.data.teams_df.set_index("id")["name"].to_dict() if not result.data.teams_df.empty else {}
-            rows = []
-            for r in gw_fx.itertuples(index=False):
-                rows.append({"Home": team_names.get(r.team_h, r.team_h), "Away": team_names.get(r.team_a, r.team_a),
-                             "Home FDR": getattr(r, "team_h_difficulty", None), "Away FDR": getattr(r, "team_a_difficulty", None)})
-            if rows:
-                st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-            else:
-                st.caption(f"No fixtures found for GW{gw} (blank gameweek).")
+    with st.expander("Team strength (Elo) ratings, from historical results"):
+        from fpl_predictor.data_sources.team_strength import build_team_strength_table
+        st.dataframe(build_team_strength_table(result.elo_ratings), hide_index=True, use_container_width=True)
 
 # --- Backtest ------------------------------------------------------------
 with tab_backtest:

@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 
 from fpl_predictor.config import MAX_SQUAD_COST
+from fpl_predictor.data_sources.team_strength import EloRatings, compute_elo_ratings
 from fpl_predictor.features import create_feature_frame, feature_columns_present
 from fpl_predictor.forecast import predict_future_gameweeks
 from fpl_predictor.model import train_model
@@ -95,6 +96,7 @@ def run_backtest(
     end_gw: int | None = None,
     budget: float = MAX_SQUAD_COST,
     tune: bool = False,
+    elo_ratings: EloRatings | None = None,
 ) -> BacktestReport:
     """Replay the pipeline gameweek-by-gameweek over already-completed
     history. ``tune=False`` (default) skips per-gameweek hyperparameter
@@ -106,6 +108,7 @@ def run_backtest(
     if history_df.empty or "round" not in history_df.columns:
         return report
 
+    elo_ratings = elo_ratings or compute_elo_ratings()
     rounds = sorted(history_df["round"].unique())
     lo = start_gw if start_gw is not None else rounds[0] + min_train_gws
     hi = end_gw if end_gw is not None else rounds[-1]
@@ -117,14 +120,14 @@ def run_backtest(
         train_history = history_df[history_df["round"] < gw]
         if train_history.empty:
             continue
-        feat_df = create_feature_frame(train_history, data.players_df, data.fixtures_df)
+        feat_df = create_feature_frame(train_history, data.players_df, data.fixtures_df, elo_ratings)
         if feat_df.empty or feat_df["round"].nunique() < min_train_gws:
             continue
 
         feature_cols = feature_columns_present(feat_df)
         trained_model = train_model(feat_df, feature_cols, tune=tune)
 
-        pred_df = predict_future_gameweeks(trained_model, feat_df, data.players_df, data.fixtures_df, [gw])
+        pred_df = predict_future_gameweeks(trained_model, feat_df, data.players_df, data.fixtures_df, elo_ratings, [gw])
         gw_col = f"GW{gw}_Points"
         if pred_df.empty or gw_col not in pred_df.columns:
             continue
