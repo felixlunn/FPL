@@ -57,10 +57,21 @@ Live FPL API ─▶ feature engineering ─▶ per-position LightGBM models ─�
   during that window there is no (player, gameweek) data yet to train a
   model on. Rather than falling back to fake data, the app detects this
   and switches to a baseline that uses each player's last-season per-90
-  output (from the FPL API's `history_past`) scaled by fixture difficulty
-  and playing probability -- still real players, just a simpler model
-  until GW1 results land, at which point full model training resumes
+  output (from the FPL API's `history_past`), scaled by fixture
+  difficulty **and by their share of last season's available minutes**
+  (`fpl_predictor/forecast.py`, `predict_cold_start_gameweek`) -- the
+  latter matters a lot: a player with a great scoring rate from a
+  handful of substitute cameos must not outrank a nailed-on regular just
+  because their small-sample rate-when-played happens to be higher, and
+  per-90 rate alone can't tell the two apart. Real players, just a
+  simpler model, until GW1 results land and full model training resumes
   automatically.
+- **Prediction intervals for captaincy**: alongside the main point
+  estimate, a separate LightGBM quantile model predicts each player's
+  10th/90th percentile range (`fpl_predictor/quantile_model.py`) --
+  captaincy is then a genuine choice between a safe, tightly-bunched
+  pick and a high-ceiling differential that happens to share the same
+  average, not a guess. See the **Captaincy** panel in Optimal Squad.
 - **Team playing style**: `fpl_predictor/team_style.py` classifies each
   club as Attacking, Balanced, or Defensive from real match results
   (goals scored/conceded per game, z-scored against the rest of the
@@ -98,6 +109,15 @@ Live FPL API ─▶ feature engineering ─▶ per-position LightGBM models ─�
   minutes model) -- so each addition is demonstrated to help rather than
   just assumed. See "Ablation study results" below for what it found on
   the synthetic demo data.
+- **Historical backtesting**: `fpl_predictor/historical_data.py` +
+  `fpl_predictor/historical_backtest.py` (run via
+  `python -m fpl_predictor.historical_backtest`) replay the same
+  walk-forward backtest against *real* past FPL seasons, fetched from the
+  public [vaastav/Fantasy-Premier-League](https://github.com/vaastav/Fantasy-Premier-League)
+  archive (not an official FPL data source; the live API only exposes the
+  current season's per-gameweek history, so this is the only way to
+  validate against real prior seasons). See "Historical backtest results"
+  below.
 
 ## Running the web app
 
@@ -115,7 +135,8 @@ user-adjustable); use the sidebar to set your free transfers and to
 switch between live data and offline demo data. Tabs:
 
 - **Optimal Squad** — the best possible 15 under budget/rules, plus the
-  optimal starting XI, captain, and bench for the selected gameweek.
+  optimal starting XI, captain, and bench for the selected gameweek, and
+  a floor-vs-ceiling captaincy comparison for the squad.
 - **My Squad** — enter your own 15 players and see your best XI/captain,
   with validation against all squad rules.
 - **Transfers** — best transfer(s) from your squad, only recommending a
@@ -186,6 +207,11 @@ app detects this and switches to the bundled synthetic demo league
 automatically (with a banner explaining why), so the UI and model
 pipeline are still fully exercisable offline.
 
+`fpl_predictor/historical_backtest.py` and `historical_data.py` have a
+separate network dependency: `raw.githubusercontent.com` (the public
+vaastav/Fantasy-Premier-League archive), independent of the live FPL
+API. An environment can have one reachable without the other.
+
 ## Running the tests
 
 ```bash
@@ -206,11 +232,14 @@ fpl_predictor/
   features.py             rolling/lag feature engineering
   model.py                per-position LightGBM training + tuning
   minutes_model.py         P(60+ mins) rotation-risk classifier
+  quantile_model.py         10th/90th percentile floor-ceiling model
   forecast.py              project models onto future gameweeks
   optimizer.py             ILP squad/XI/transfer optimization
   pipeline.py              orchestration + synthetic demo dataset
   backtest.py               walk-forward validation over past gameweeks
   ablation.py               component-by-component validation via the backtest
+  historical_data.py        real past-season data from the vaastav archive
+  historical_backtest.py    backtest replayed against real past seasons
   team_style.py             Attacking/Balanced/Defensive classification per team
   stats_correlation.py      underlying (Opta-derived) stats vs. actual points
 app.py                     Streamlit web interface
