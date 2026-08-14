@@ -61,6 +61,9 @@ def predict_future_gameweeks(
     result = base_rows[["web_name", "team_name", "element_type", "now_cost", "player_id"]].copy()
     if minutes_model is not None:
         result["start_probability"] = minutes_model.predict_proba(base_rows)
+    if "selected_by_percent" in players_df.columns:
+        own_lookup = players_df.set_index("id")["selected_by_percent"]
+        result["selected_by_percent"] = pd.to_numeric(result["player_id"].map(own_lookup), errors="coerce").fillna(0.0)
 
     for gw in gameweeks:
         col_name = f"GW{gw}_Points"
@@ -111,6 +114,20 @@ _COLD_START_DEFAULT_PER90 = {1: 2.0, 2: 2.4, 3: 2.6, 4: 2.6}  # GKP, DEF, MID, F
 _FULL_SEASON_MINUTES = 38 * 90  # ceiling for "played every available minute last season"
 _UNKNOWN_PLAYER_RELIABILITY = 0.5  # no last-season data at all (rookie / new to the PL) -- genuinely unknown, not assumed nailed-on
 _MIN_RELIABILITY = 0.05  # never fully zero out someone who could still feature
+_MIN_ASSUMED_MINUTES = 45.0  # even a fringe player who does feature usually gets more than a token cameo
+_MAX_ASSUMED_MINUTES = 90.0  # a fully nailed-on player
+
+
+def _assumed_minutes(reliability: float) -> float:
+    """Minutes a player is assumed to get *when selected*, scaled by their
+    own reliability rather than one flat number for everyone -- a nailed-on
+    regular (reliability near 1.0) realistically plays close to 90 most
+    weeks, while a fringe option who does feature typically does so for
+    only part of a game. Linear between the two bounds; at the old flat
+    68-minute assumption's implied reliability (~0.5) this returns the
+    same ~68, so it's a refinement of that heuristic, not a break from it.
+    """
+    return _MIN_ASSUMED_MINUTES + (_MAX_ASSUMED_MINUTES - _MIN_ASSUMED_MINUTES) * reliability
 
 
 def predict_cold_start_gameweek(
@@ -125,7 +142,7 @@ def predict_cold_start_gameweek(
     (player, gameweek) -> points data yet to train a model on, so instead
     of refusing to show real players, fall back to each player's own
     last-season per-90 output (from the FPL API's ``history_past``),
-    scaled by an assumed ~68 minutes when selected and by fixture
+    scaled by an assumed minutes-when-selected figure and by fixture
     difficulty (FPL's own FDR) -- then the usual playing-probability
     adjustment is layered on top by the caller, exactly as for the
     trained-model path.
@@ -142,6 +159,15 @@ def predict_cold_start_gameweek(
     risk entirely, and this is exactly the bug that under a previous
     version of this function ranked a limited-minutes squad player above
     established starters.
+
+    The assumed minutes figure itself scales with reliability rather than
+    being one flat number for every player (see ``_assumed_minutes``): a
+    nailed-on regular realistically plays close to a full 90 most weeks,
+    while a fringe option who does feature usually does so for only part
+    of a game. Treating both the same way systematically under-predicts a
+    strong, mostly-nailed squad's output -- a full-season projection of a
+    well-optimized squad's total is a useful sanity check here, since a
+    real, well-run FPL season lands somewhere around 2000-2500 points.
     """
     if players_df.empty:
         return pd.DataFrame()
@@ -171,7 +197,8 @@ def predict_cold_start_gameweek(
     base = players_df.copy()
     base["_per90"] = base.apply(_per90, axis=1)
     base["_reliability"] = base.apply(_reliability, axis=1)
-    base["_baseline_pts"] = base["_per90"] * (68.0 / 90.0) * base["_reliability"]  # assumed minutes when selected, discounted by how nailed-on they actually were
+    base["_assumed_minutes"] = base["_reliability"].apply(_assumed_minutes)
+    base["_baseline_pts"] = base["_per90"] * (base["_assumed_minutes"] / 90.0) * base["_reliability"]  # assumed minutes when selected, discounted by how nailed-on they actually were
 
     fixtures_lookup = _fixtures_by_team_and_gw(fixtures_df)
 
@@ -199,6 +226,8 @@ def predict_cold_start_gameweek(
     # min(playing_prob, start_probability) blend looks for; reusing it
     # here would apply this same discount a second time).
     out["last_season_reliability"] = base["_reliability"].to_numpy()
+    if "selected_by_percent" in base.columns:
+        out["selected_by_percent"] = pd.to_numeric(base["selected_by_percent"], errors="coerce").fillna(0.0).to_numpy()
     return out.sort_values("pred_points_total", ascending=False).reset_index(drop=True)
 
 

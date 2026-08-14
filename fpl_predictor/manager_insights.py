@@ -60,6 +60,48 @@ def fetch_manager_picks(entry_id: int, gw: int, ttl_seconds: int = 3600) -> dict
     return data or {}
 
 
+def fetch_entry_info(entry_id: int, ttl_seconds: int = 3600) -> dict:
+    data, _ = fetch_json(f"{FPL_BASE}entry/{entry_id}/", cache_name=f"entry_{entry_id}_info", ttl_seconds=ttl_seconds)
+    return data or {}
+
+
+def fetch_entry_squad(entry_id: int, gw: int | None) -> dict:
+    """A real manager's actual 15-man squad (element ids + captain/vice)
+    for a specific gameweek, via the same public per-gameweek picks
+    endpoint used for top-manager sampling -- the "give the app your
+    team" entry point, so a manager doesn't have to rebuild their squad
+    by hand from a list of names.
+
+    Important constraint: FPL keeps a team's picks private until that
+    gameweek's deadline has passed (so rivals can't copy a last-minute
+    move), so this only works for a gameweek that's already locked --
+    never the *upcoming* one. Pass ``gw=None`` (e.g. before any gameweek
+    this season has a passed deadline) to get the explanatory "not
+    available yet" result directly, without a wasted request.
+    """
+    if gw is None:
+        return {"ok": False, "message": "Team import isn't available yet — no gameweek this season has passed its deadline, so picks aren't public yet. Build your squad manually below instead."}
+
+    entry_info = fetch_entry_info(entry_id)
+    if not entry_info:
+        return {"ok": False, "message": f"No FPL team found with ID {entry_id}. Double-check the number from your team's URL on the FPL site (fantasy.premierleague.com/entry/<ID>/...)."}
+
+    picks_data = fetch_manager_picks(entry_id, gw)
+    picks = picks_data.get("picks", [])
+    if not picks:
+        return {"ok": False, "message": f"GW{gw} picks aren't public for this team yet. This becomes available once that gameweek's deadline has passed -- build your squad manually below in the meantime."}
+
+    return {
+        "ok": True,
+        "team_name": entry_info.get("name", "Your team"),
+        "manager_name": f"{entry_info.get('player_first_name', '')} {entry_info.get('player_last_name', '')}".strip(),
+        "gw": gw,
+        "element_ids": [p["element"] for p in picks],
+        "captain_element": next((p["element"] for p in picks if p.get("is_captain")), None),
+        "vice_captain_element": next((p["element"] for p in picks if p.get("is_vice_captain")), None),
+    }
+
+
 @dataclass
 class ManagerInsights:
     n_managers_sampled: int = 0

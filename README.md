@@ -92,14 +92,28 @@ Live FPL API ─▶ feature engineering ─▶ per-position LightGBM models ─�
 - **Optimization**: squad selection, starting XI, and transfer
   suggestions are all solved as integer linear programs (PuLP/CBC)
   against the real FPL rules (£100m budget, 15-man squad, max 3 per club,
-  valid formations), so results are the actual optimum given the model's
-  predictions — not a greedy approximation
+  valid formations). Squad selection is a *joint* squad + starting-XI +
+  captain solve, not a separate "pick the best 15 by total points" step —
+  a squad can only ever field 11, so maximizing all 15 equally used to
+  let a plan win on paper by stacking bench depth in a position instead
+  of upgrading a starter. Bench players count at a small fraction of a
+  starter's weight (`BENCH_WEIGHT`) and the captain's points count twice,
+  so "best substitute" now actually means "most improves what you field"
   (`fpl_predictor/optimizer.py`).
+- **Ownership-aware scoring**: `selected_by_percent` is blended into
+  squad/XI selection everywhere, not just for differentials — a small
+  positive default weight (`DEFAULT_OWNERSHIP_WEIGHT`) nudges toward
+  well-owned players when the model is otherwise close to indifferent
+  (heavy ownership is itself weak evidence, and protects rank), while the
+  **Differential** transfer strategy applies a larger *negative* weight
+  instead, deliberately hunting the opposite signal. Never changes a
+  player's predicted points, only which similarly-rated player gets
+  picked. Shown as an **Owned %** column in Player Explorer.
 - **Multiple transfer strategies**: `suggest_transfer_options` returns
   three differently-motivated plans side by side rather than one number to
-  take or leave — **Optimal** (best net predicted points, hits included
+  take or leave — **Optimal** (best net starting-XI value, hits included
   when they pay off), **Safe** (best plan using only your free
-  transfer(s), never risks a −4), and **Differential** (biases toward
+  transfer(s), never risks a −4), and **Differential** (leans toward
   lower-ownership players, for climbing rank against a mini-league full of
   the same template picks rather than just maximizing raw expected
   points). See the **Transfers** tab.
@@ -119,6 +133,31 @@ Live FPL API ─▶ feature engineering ─▶ per-position LightGBM models ─�
   ceiling). These are transparent, stated-reason heuristics meant to
   prompt a closer look, not another ILP claiming one provably-correct
   answer — chip timing is a judgement call. See the **Season Planner** tab.
+- **Full-season projection**: `project_full_season` extends the same
+  forecast all the way to GW38 (not just the short look-ahead window) and
+  applies captain doubling each week, giving a headline "predicted season
+  total" directly comparable to a real manager's reported total. This
+  surfaced a real calibration gap — a well-optimized live squad projected
+  to only ~1763 points, well under what a well-run real season actually
+  totals (roughly 2000–2500) — traced to the cold-start baseline assuming
+  a single flat ~68-minutes-when-selected figure for every player
+  regardless of how nailed-on they are. `_assumed_minutes` now scales
+  45–90 minutes with a player's own reliability instead; the same live
+  squad now projects to ~2243 points. See **Full-season projection** in
+  Season Planner.
+- **Rotation advice**: `recommend_rotation_plan` flags squad players the
+  model's own week-by-week optimal XI would bench for a bounded stretch
+  (started before *and* after the dip — usually a tough run of fixtures)
+  and start again later, with no transfer needed, just a lineup change.
+  See **Rotation advice** in Season Planner.
+- **Team import**: `manager_insights.fetch_entry_squad` pulls a real
+  manager's actual 15-man squad by public FPL Team ID, so getting started
+  doesn't require rebuilding a squad from a list of names — the primary
+  path in the **My Squad** tab, with manual selection kept as a fallback.
+  FPL keeps a gameweek's picks private until its deadline passes, so this
+  only works for a gameweek that's already locked (never the upcoming
+  one) — handled with a clear explanatory message rather than a silent
+  failure when it isn't available yet.
 - **Top-manager learnings**: `fpl_predictor/manager_insights.py` samples
   the top-ranked managers in FPL's public "Overall" classic league (fully
   public data, no login needed) for their chip-usage and captaincy
@@ -171,18 +210,24 @@ switch between live data and offline demo data. Tabs:
 - **Optimal Squad** — the best possible 15 under budget/rules, plus the
   optimal starting XI, captain, and bench for the selected gameweek, and
   a floor-vs-ceiling captaincy comparison for the squad.
-- **My Squad** — enter your own 15 players and see your best XI/captain,
-  with validation against all squad rules.
+- **My Squad** — import your real squad by FPL Team ID (once your
+  gameweek's deadline has passed and picks are public), or build one
+  manually; see your best XI/captain, with validation against all squad
+  rules.
 - **Transfers** — three side-by-side transfer strategies (Optimal / Safe
-  / Differential) from your squad, each with its own stated rationale,
-  and each in/out player shown with their next-5 fixture run.
+  / Differential) from your squad, scored by how much each would improve
+  your actual starting XI rather than raw squad-wide points, each with
+  its own stated rationale and each in/out player shown with their
+  next-5 fixture run.
 - **Season Planner** — a multi-gameweek look-ahead: your squad's
-  predicted-points trend over the next several gameweeks, heuristic chip
-  timing suggestions (Wildcard/Free Hit/Bench Boost/Triple Captain), and
-  a colour-coded fixture-difficulty ticker across the same window.
+  predicted-points trend, a full-season (through GW38) projected total
+  with captain doubling, heuristic chip timing suggestions
+  (Wildcard/Free Hit/Bench Boost/Triple Captain), rotation advice
+  (bench-now-return-later without a transfer), and a colour-coded
+  fixture-difficulty ticker.
 - **Player Explorer** — filterable/sortable table of every player's
-  predicted points, start probability, points-per-million, and next-5
-  fixture run across upcoming gameweeks.
+  predicted points, start probability, ownership %, points-per-million,
+  and next-5 fixture run across upcoming gameweeks.
 - **Model Insights** — per-position validation error, minutes-model
   Brier score, feature importance, the upcoming gameweek's fixture
   difficulty ratings, each team's playing-style classification, how well
@@ -330,8 +375,8 @@ fpl_predictor/
   historical_backtest.py    backtest replayed against real past seasons
   team_style.py             Attacking/Balanced/Defensive classification per team
   stats_correlation.py      underlying (Opta-derived) stats vs. actual points
-  season_planner.py          multi-gameweek forecast + chip-timing heuristics
-  manager_insights.py        top-manager chip/captain patterns (public Overall league)
+  season_planner.py          multi-gameweek forecast, full-season projection, chip-timing + rotation heuristics
+  manager_insights.py        top-manager chip/captain patterns + team-ID import (public Overall league)
 app.py                     Streamlit web interface
 tests/                     pytest suite (offline, uses demo data)
 ```
@@ -404,8 +449,21 @@ tests/                     pytest suite (offline, uses demo data)
   winners' decisions the way `historical_data.py` can for player-level
   stats. Early in a season (or between seasons) this panel will have
   little or nothing to show, by construction rather than a bug.
-- The Differential transfer strategy uses a fixed ownership-penalty
-  weight (`DIFFERENTIAL_OWNERSHIP_WEIGHT = 0.04` predicted points per %
-  owned) rather than one tuned against real rank-climbing outcomes --
-  reasonable by inspection, not empirically validated the way the main
-  model's hyperparameters are.
+- The Differential transfer strategy, the default template-safety nudge,
+  and `BENCH_WEIGHT` are fixed, inspected-by-eye constants
+  (`optimizer.py`) rather than values tuned against real rank-climbing or
+  season-long outcomes -- reasonable in direction and rough magnitude,
+  not empirically validated the way the main model's hyperparameters are.
+- Full-season projections get less reliable the further out they run --
+  fixture data for the whole season is available up front, but a
+  player's own form/rotation pattern many months from now is inherently
+  uncertain. Treat the projected season total as an order-of-magnitude
+  sanity check on a squad, not a precise forecast; it's also necessarily
+  optimistic in one respect (no injuries/suspensions/transfers-away
+  modelled over 38 gameweeks) and pessimistic in another (assumes the
+  same 15 all season, with no user transfers to actually improve it).
+- Team import only works for a gameweek whose deadline has already
+  passed -- FPL keeps a manager's picks private until then, so there's no
+  way to pull a squad for the *upcoming*, not-yet-locked gameweek. Early
+  in a season (before GW1's deadline) or the moment a new deadline is
+  approaching, this will report "not available yet" rather than a squad.
