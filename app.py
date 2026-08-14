@@ -20,7 +20,13 @@ from fpl_predictor.config import MAX_SQUAD_COST, POS_MAP
 from fpl_predictor.data_sources.fpl_api import fixture_ticker_table, team_fixture_strings
 from fpl_predictor.optimizer import build_starting_xi, find_optimal_squad, suggest_transfer_options, validate_squad
 from fpl_predictor.pipeline import PipelineResult, build_demo_data, fetch_live_data, needs_demo_fallback, run_pipeline
-from fpl_predictor.season_planner import DEFAULT_HORIZON, build_multi_gw_forecast, recommend_chip_windows
+from fpl_predictor.season_planner import (
+    DEFAULT_HORIZON,
+    build_multi_gw_forecast,
+    project_full_season,
+    recommend_chip_windows,
+    recommend_rotation_plan,
+)
 from fpl_predictor.stats_correlation import compute_stat_correlations
 from fpl_predictor.team_style import compute_team_styles
 
@@ -289,10 +295,49 @@ with tab_optimal:
 
 # --- My squad ---------------------------------------------------------------
 with tab_mine:
-    st.caption("Pick your current 15-man squad to check it's valid and see your optimal starting XI + captain.")
+    st.caption("The easiest way in: import your real squad by Team ID. Or build one manually below.")
     if "my_squad" not in st.session_state:
         st.session_state.my_squad = {pos: [] for pos in POS_MAP}
+    squad_already_set = any(st.session_state.my_squad.values())
 
+    with st.expander("\U0001f4e5 Import your team by FPL Team ID", expanded=not squad_already_set):
+        st.caption(
+            "Find your Team ID in the URL when viewing your team on the FPL site — "
+            "fantasy.premierleague.com/entry/**1234567**/... — the number is your Team ID. "
+            "Only available once your current gameweek's deadline has passed (FPL keeps picks private until then)."
+        )
+        ic1, ic2 = st.columns([3, 1])
+        team_id_input = ic1.number_input("FPL Team ID", min_value=1, step=1, value=None, key="team_id_input", label_visibility="collapsed", placeholder="e.g. 1234567")
+        import_clicked = ic2.button("Import my team", type="primary", use_container_width=True)
+        if import_clicked:
+            if not team_id_input:
+                st.warning("Enter your Team ID first.")
+            else:
+                with st.spinner("Fetching your team..."):
+                    squad_info = manager_insights.fetch_entry_squad(int(team_id_input), result.data.current_gw)
+                if not squad_info["ok"]:
+                    st.error(squad_info["message"])
+                else:
+                    new_squad = {pos: [] for pos in POS_MAP}
+                    matched = 0
+                    for pid in squad_info["element_ids"]:
+                        row = pred_df[pred_df["player_id"] == pid]
+                        if row.empty:
+                            continue
+                        new_squad[int(row.iloc[0]["element_type"])].append(pid)
+                        matched += 1
+                    for pos_id, ids in new_squad.items():
+                        st.session_state[f"multiselect_{pos_id}"] = ids
+                    st.session_state.my_squad = new_squad
+                    st.session_state["import_success_message"] = (
+                        f"Imported **{squad_info['team_name']}** ({squad_info['manager_name']}) — "
+                        f"GW{squad_info['gw']} squad, {matched}/{len(squad_info['element_ids'])} players matched."
+                    )
+                    st.rerun()
+        if st.session_state.get("import_success_message"):
+            st.success(st.session_state.pop("import_success_message"))
+
+    st.markdown("**...or build your squad manually:**")
     cols = st.columns(4)
     for col, (pos_id, pos_label) in zip(cols, POS_MAP.items()):
         pos_pool = pred_df[pred_df["element_type"] == pos_id].sort_values("web_name")
@@ -335,8 +380,10 @@ with tab_mine:
 # --- Transfers ---------------------------------------------------------------
 with tab_transfers:
     st.caption(
-        "Uses your squad from the 'My Squad' tab as the starting point. Three strategies are shown side by side, "
-        "each optimizing for something different, rather than handing you a single number to take or leave."
+        "Uses your squad from the 'My Squad' tab as the starting point. Substitutes are scored by how much they'd "
+        "improve your actual starting XI (captain counted double, bench barely counted) — not just raw squad-wide "
+        "points, which used to recommend bench upgrades that never actually helped you. Three strategies are shown "
+        "side by side, each optimizing for something different, rather than handing you a single number to take or leave."
     )
     all_ids = [pid for ids in st.session_state.get("my_squad", {}).values() for pid in ids]
     my_squad_df = pred_df[pred_df["player_id"].isin(all_ids)].drop_duplicates(subset=["player_id"])
@@ -405,6 +452,23 @@ with tab_planner:
                                  yaxis_title="Predicted points", height=320, margin=dict(l=10, r=10, t=40, b=10))
         st.plotly_chart(trend_fig, use_container_width=True, theme="streamlit")
 
+        st.subheader("Full-season projection")
+        st.caption(
+            "This squad's predicted total across the *entire remaining season* (through GW38), captain doubling "
+            "included each week — directly comparable to a real manager's reported season total. Far-future weeks "
+            "are necessarily less certain than next week's, so treat this as an order-of-magnitude sanity check "
+            "(a well-run real FPL season typically lands somewhere around 2000–2500 points), not a precise forecast."
+        )
+        with st.spinner("Projecting the full remaining season..."):
+            season_proj = project_full_season(result, planner_squad_df)
+        if not season_proj:
+            st.caption("Not enough data to project the full season right now.")
+        else:
+            sp1, sp2, sp3 = st.columns(3)
+            sp1.metric("Projected season total", f"{season_proj['total_points']:.0f} pts")
+            sp2.metric("Gameweeks remaining", season_proj["n_gws"])
+            sp3.metric("Avg. per gameweek", f"{season_proj['points_per_gw']:.1f} pts")
+
         st.subheader("Chip timing suggestions")
         recs = recommend_chip_windows(multi_pred, planner_gws, result.data.fixtures_df, result.data.teams_df, current_squad_df=planner_squad_df)
         if not recs:
@@ -412,6 +476,23 @@ with tab_planner:
         else:
             for r in recs:
                 st.info(f"**{r.chip} — GW{r.gw}**: {r.reason}")
+
+        st.subheader("Rotation advice (no transfer needed)")
+        st.caption(
+            "Players already in this squad who the model's own week-by-week optimal XI would bench for a stretch "
+            "(usually a tough run of fixtures) and start again later — no transfer required, just a lineup change."
+        )
+        rotation_plan = recommend_rotation_plan(multi_pred, planner_gws, planner_squad_df, result.data.fixtures_df, result.data.teams_df)
+        if rotation_plan.empty:
+            st.caption("No clear bench-and-return cases in this window.")
+        else:
+            st.dataframe(
+                rotation_plan[["player", "bench_from_gw", "bench_to_gw", "return_gw", "reason"]].rename(columns={
+                    "player": "Player", "bench_from_gw": "Bench from", "bench_to_gw": "Bench to",
+                    "return_gw": "Returns", "reason": "Why",
+                }),
+                hide_index=True, use_container_width=True,
+            )
 
         st.subheader("Fixture ticker")
         st.caption("Green = easier fixtures (low FDR), red = harder (high FDR). '+' marks a double gameweek.")
@@ -445,9 +526,11 @@ with tab_explorer:
         view["Start %"] = (view["start_probability"] * 100).round(0).astype(int)
     elif "last_season_reliability" in view.columns:
         view["Reliability %"] = (view["last_season_reliability"] * 100).round(0).astype(int)
+    if "selected_by_percent" in view.columns:
+        view["Owned %"] = pd.to_numeric(view["selected_by_percent"], errors="coerce").fillna(0.0).round(1)
 
     show_cols = ["web_name", "team_name", "POS", "now_cost"] + result.gw_cols + ["pred_points_total", "pred_points_total_adj", "PPM"]
-    for extra in ("Start %", "Reliability %", "Next 5"):
+    for extra in ("Start %", "Reliability %", "Owned %", "Next 5"):
         if extra in view.columns:
             show_cols.append(extra)
     show_cols = [c for c in show_cols if c in view.columns]

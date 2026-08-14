@@ -83,6 +83,19 @@ def test_cold_start_reliability_discounts_low_minutes_players():
     assert regular_rel > fringe_rel
 
 
+def test_ownership_column_flows_through_to_predictions(result):
+    # selected_by_percent must survive from players_df into pred_df in both
+    # trained and cold-start modes -- the optimizer's ownership-weighted
+    # scoring (default template nudge, Differential's opposite-signed
+    # penalty) is a silent no-op without it.
+    assert "selected_by_percent" in result.pred_df.columns
+    assert result.pred_df["selected_by_percent"].notna().all()
+
+    cold = run_pipeline(build_demo_data(n_gws=0, n_future_gws=2, seed=4))
+    assert cold.mode == "cold_start"
+    assert "selected_by_percent" in cold.pred_df.columns
+
+
 def test_fixture_difficulty_feature_is_populated_and_varies(result):
     # FPL's own FDR (1-5), joined in per (team, gameweek, opponent) --
     # replaces the old Elo/historical-CSV team-strength model entirely.

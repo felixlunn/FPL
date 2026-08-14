@@ -23,6 +23,7 @@ import pandas as pd
 from fpl_predictor.config import MAX_FPL_GW
 from fpl_predictor.data_sources.fpl_api import fixtures_long_by_team
 from fpl_predictor.forecast import apply_playing_probability, predict_cold_start_gameweek, predict_future_gameweeks
+from fpl_predictor.optimizer import build_starting_xi, find_optimal_squad
 
 DEFAULT_HORIZON = 6
 
@@ -50,7 +51,7 @@ def build_multi_gw_forecast(result, n_gws: int = DEFAULT_HORIZON) -> tuple[pd.Da
         )
     elif result.mode == "cold_start":
         merged = None
-        keep_cols = ["player_id", "web_name", "team_name", "element_type", "now_cost", "last_season_reliability"]
+        keep_cols = ["player_id", "web_name", "team_name", "element_type", "now_cost", "last_season_reliability", "selected_by_percent"]
         for gw in gws:
             single = predict_cold_start_gameweek(result.data.players_df, result.data.past_seasons_df, result.data.fixtures_df, gw)
             if single.empty:
@@ -179,7 +180,6 @@ def recommend_chip_windows(
         ))
 
     if current_squad_df is not None and not current_squad_df.empty:
-        from fpl_predictor.optimizer import find_optimal_squad
         current_ids = set(current_squad_df["player_id"])
         best_gap, best_gw = None, None
         for gw in gws:
@@ -202,3 +202,128 @@ def recommend_chip_windows(
             ))
 
     return sorted(recs, key=lambda r: r.gw)
+
+
+def project_full_season(result, squad_df: pd.DataFrame) -> dict:
+    """Projects a squad's points across the *entire remaining season* (the
+    next unplayed gameweek through GW38), applying captain doubling each
+    week the same way a real gameweek actually scores -- so the total is
+    directly comparable to a real manager's reported season total, not
+    just a raw sum of XI point-estimates.
+
+    This reuses the same per-gameweek forecast as the short look-ahead,
+    just extended across the whole remaining calendar -- fixture data for
+    the full season is already published up front, even though far-future
+    form/rotation estimates are necessarily less certain than next week's;
+    treat this as an order-of-magnitude sanity check on a squad, not a
+    precise forecast that far out. Returns ``{}`` if there's no target
+    gameweek to project from, or the squad is empty.
+    """
+    start_gw = result.future_gws[0] if result.future_gws else None
+    if start_gw is None or squad_df is None or squad_df.empty:
+        return {}
+    remaining = MAX_FPL_GW - start_gw + 1
+    if remaining <= 0:
+        return {}
+    multi_pred, gws = build_multi_gw_forecast(result, n_gws=remaining)
+    if multi_pred.empty:
+        return {}
+
+    squad_pred = multi_pred[multi_pred["player_id"].isin(squad_df["player_id"])]
+    per_gw_rows, total = [], 0.0
+    for gw in gws:
+        gw_col = f"GW{gw}_Points"
+        if gw_col not in squad_pred.columns:
+            continue
+        lineup, bench, captain, vice = build_starting_xi(squad_pred, gw_col)
+        captain_bonus = float(captain[gw_col]) if isinstance(captain, pd.Series) and gw_col in captain.index else 0.0
+        gw_points = float(lineup[gw_col].sum()) + captain_bonus
+        total += gw_points
+        per_gw_rows.append({"gw": gw, "points": gw_points})
+
+    return {
+        "total_points": total,
+        "n_gws": len(per_gw_rows),
+        "start_gw": start_gw,
+        "per_gw": pd.DataFrame(per_gw_rows),
+        "points_per_gw": total / len(per_gw_rows) if per_gw_rows else 0.0,
+    }
+
+
+def _avg_team_fdr(fixtures_df: pd.DataFrame, teams_df: pd.DataFrame, team_name: str, gws: list[int]) -> float | None:
+    """Average FDR (easier of the two on a double gameweek) a team faces
+    across ``gws`` -- used to explain *why* a rotation dip is suggested,
+    not just that one was detected.
+    """
+    if not gws or teams_df is None or teams_df.empty:
+        return None
+    long_df = fixtures_long_by_team(fixtures_df)
+    if long_df.empty:
+        return None
+    name_to_id = dict(zip(teams_df["name"], teams_df["id"]))
+    team_id = name_to_id.get(team_name)
+    if team_id is None:
+        return None
+    sub = long_df[(long_df["team"] == team_id) & (long_df["event"].isin(gws))]
+    if sub.empty:
+        return None
+    return float(sub.groupby("event")["difficulty"].min().mean())
+
+
+def recommend_rotation_plan(
+    multi_pred_df: pd.DataFrame,
+    gws: list[int],
+    squad_df: pd.DataFrame,
+    fixtures_df: pd.DataFrame,
+    teams_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Bench-now, start-later advice for players already in the squad --
+    distinct from a transfer: nobody leaves the squad, they just sit out
+    the gameweeks where the model's own week-by-week optimal XI wouldn't
+    start them (typically a tough run of fixtures), flagged to return once
+    it would start them again.
+
+    Only reports a *bounded* dip -- started before AND after within the
+    window -- a player who simply never makes the XI in this window isn't
+    a rotation case, they're a "doesn't deserve a squad spot" case (which
+    the Transfers tab, not this, is meant to catch).
+    """
+    if multi_pred_df.empty or not gws or squad_df is None or squad_df.empty:
+        return pd.DataFrame()
+
+    squad_pred = multi_pred_df[multi_pred_df["player_id"].isin(squad_df["player_id"])]
+    starters_by_gw: dict[int, set] = {}
+    for gw in gws:
+        gw_col = f"GW{gw}_Points"
+        if gw_col not in squad_pred.columns:
+            continue
+        lineup, *_ = build_starting_xi(squad_pred, gw_col)
+        starters_by_gw[gw] = set(lineup["player_id"]) if not lineup.empty else set()
+
+    ordered_gws = [g for g in gws if g in starters_by_gw]
+    team_by_player = dict(zip(squad_df["player_id"], squad_df.get("team_name", pd.Series(dtype=str))))
+    name_by_player = dict(zip(squad_df["player_id"], squad_df["web_name"]))
+
+    rows = []
+    for pid in squad_df["player_id"]:
+        flags = [pid in starters_by_gw[gw] for gw in ordered_gws]
+        i = 0
+        while i < len(flags):
+            if flags[i]:
+                i += 1
+                continue
+            j = i
+            while j < len(flags) and not flags[j]:
+                j += 1
+            if i > 0 and j < len(flags):  # a genuine dip: started before AND after
+                bench_gws = ordered_gws[i:j]
+                avg_fdr = _avg_team_fdr(fixtures_df, teams_df, team_by_player.get(pid), bench_gws)
+                span = f"GW{bench_gws[0]}" if len(bench_gws) == 1 else f"GW{bench_gws[0]}–GW{bench_gws[-1]}"
+                reason = f"Drops out of your model-optimal XI for {span}" + (f" (avg fixture difficulty {avg_fdr:.1f})" if avg_fdr is not None else "") + f", back in for GW{ordered_gws[j]}."
+                rows.append({
+                    "player_id": pid, "player": name_by_player.get(pid, str(pid)),
+                    "bench_from_gw": bench_gws[0], "bench_to_gw": bench_gws[-1],
+                    "return_gw": ordered_gws[j], "reason": reason,
+                })
+            i = j
+    return pd.DataFrame(rows)
