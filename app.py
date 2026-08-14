@@ -23,6 +23,25 @@ from fpl_predictor.team_style import compute_team_styles
 
 st.set_page_config(page_title="FPL Predictor", page_icon="⚽", layout="wide")
 
+# Light, targeted tightening pass: less top/vertical padding, calmer
+# heading sizes, softer metric labels, rounded table corners, a tighter
+# tab bar. Deliberately conservative -- no restructuring, just less
+# visual noise around the same layout.
+st.markdown("""
+<style>
+.block-container { padding-top: 2rem; padding-bottom: 2.5rem; }
+h1 { font-size: 1.65rem !important; }
+h2 { font-size: 1.3rem !important; }
+h3 { font-size: 1.1rem !important; margin-top: 0.4rem !important; }
+[data-testid="stMetricLabel"] { font-size: 0.8rem; opacity: 0.72; }
+[data-testid="stMetricValue"] { font-size: 1.6rem; }
+[data-testid="stDataFrame"] { border-radius: 8px; overflow: hidden; }
+.stTabs [data-baseweb="tab-list"] { gap: 2px; }
+.stTabs [data-baseweb="tab"] { padding: 8px 14px; }
+section[data-testid="stSidebar"] .block-container { padding-top: 1.75rem; }
+</style>
+""", unsafe_allow_html=True)
+
 # Fixed categorical colour order (blue / orange / aqua / yellow), reused
 # everywhere a position is colour-coded so identity mapping never shifts.
 POSITION_COLORS = {1: "#2a78d6", 2: "#eb6834", 3: "#1baf7a", 4: "#eda100"}
@@ -121,18 +140,34 @@ def _stat_correlation_chart(corr_df: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def _captaincy_chart(df: pd.DataFrame, gw_col: str, floor_col: str, ceiling_col: str) -> go.Figure:
+    d = df.dropna(subset=[floor_col, ceiling_col]).sort_values(gw_col, ascending=True)
+    fig = go.Figure(go.Scatter(
+        x=d[gw_col], y=d["web_name"], mode="markers", marker=dict(color=SERIES_BLUE, size=9),
+        error_x=dict(type="data", symmetric=False, array=(d[ceiling_col] - d[gw_col]).clip(lower=0),
+                      arrayminus=(d[gw_col] - d[floor_col]).clip(lower=0), color="rgba(42,120,214,0.45)", thickness=2, width=5),
+    ))
+    fig.update_layout(title="Captaincy: predicted points with floor-ceiling range", xaxis_title="Points (10th-90th percentile range)",
+                       height=max(280, 30 * len(d)), margin=dict(l=10, r=10, t=40, b=10), showlegend=False)
+    return fig
+
+
 def _lineup_table(df: pd.DataFrame, gw_col: str, captain_id=None, vice_id=None) -> pd.DataFrame:
+    # In-season: start_probability (the minutes model). Cold-start: no
+    # current-season model exists yet, so last_season_reliability (last
+    # season's share of available minutes) fills the same "how likely are
+    # they to actually feature" role instead.
+    prob_col = "start_probability" if "start_probability" in df.columns else ("last_season_reliability" if "last_season_reliability" in df.columns else None)
     cols = ["web_name", "team_name", "element_type", "now_cost", gw_col]
-    has_start_prob = "start_probability" in df.columns
-    if has_start_prob:
-        cols.append("start_probability")
+    if prob_col:
+        cols.append(prob_col)
     out = df[cols].copy()
     out["POS"] = out["element_type"].map(POS_MAP)
     out = out.drop(columns=["element_type"])
     rename = {"web_name": "Player", "team_name": "Team", "now_cost": "£m", gw_col: "Pred. Pts"}
-    if has_start_prob:
-        out["start_probability"] = (out["start_probability"] * 100).round(0).astype(int).astype(str) + "%"
-        rename["start_probability"] = "Start %"
+    if prob_col:
+        out[prob_col] = (out[prob_col] * 100).round(0).astype(int).astype(str) + "%"
+        rename[prob_col] = "Start %" if prob_col == "start_probability" else "Reliability %"
     out = out.rename(columns=rename)
     if captain_id is not None:
         out.insert(0, "", ["\U0001f451" if pid == captain_id else ("\U0001f948" if pid == vice_id else "") for pid in df["player_id"]])
@@ -156,8 +191,8 @@ if st.sidebar.button("\U0001f504 Refresh data & retrain model"):
     st.cache_resource.clear()
 
 budget = MAX_SQUAD_COST  # the real FPL budget -- fixed, not user-adjustable
-st.sidebar.metric("Budget", f"£{budget:.0f}m")
 free_transfers = st.sidebar.number_input("Free transfers", min_value=0, max_value=5, value=1, step=1)
+st.sidebar.caption(f"Budget: £{budget:.0f}m (fixed)")
 
 with st.spinner("Fetching data and training the model (walk-forward CV + hyperparameter search)..."):
     result, data_meta = _load_pipeline(mode, budget, st.session_state.cache_bust)
@@ -228,6 +263,16 @@ with tab_optimal:
             st.dataframe(_lineup_table(bench, gw_col), hide_index=True, use_container_width=True)
         with right:
             st.plotly_chart(_position_bar(squad.sort_values("pred_points_total", ascending=False), "pred_points_total", "web_name", "Squad by total predicted points"), use_container_width=True, theme="streamlit")
+
+        floor_col, ceiling_col = gw_col.replace("_Points", "_Floor"), gw_col.replace("_Points", "_Ceiling")
+        if floor_col in lineup.columns and ceiling_col in lineup.columns:
+            with st.expander("Captaincy: safe pick vs. high-ceiling differential"):
+                st.caption(
+                    "10th-90th percentile predicted range per player, from a separate quantile model -- the point "
+                    "estimate alone can't distinguish a safe, nailed-on captain from a boom-or-bust differential "
+                    "that happens to share the same average."
+                )
+                st.plotly_chart(_captaincy_chart(lineup, gw_col, floor_col, ceiling_col), use_container_width=True, theme="streamlit")
 
 # --- My squad ---------------------------------------------------------------
 with tab_mine:
@@ -320,10 +365,13 @@ with tab_explorer:
 
     if "start_probability" in view.columns:
         view["Start %"] = (view["start_probability"] * 100).round(0).astype(int)
+    elif "last_season_reliability" in view.columns:
+        view["Reliability %"] = (view["last_season_reliability"] * 100).round(0).astype(int)
 
     show_cols = ["web_name", "team_name", "POS", "now_cost"] + result.gw_cols + ["pred_points_total", "pred_points_total_adj", "PPM"]
-    if "Start %" in view.columns:
-        show_cols.append("Start %")
+    for extra in ("Start %", "Reliability %"):
+        if extra in view.columns:
+            show_cols.append(extra)
     show_cols = [c for c in show_cols if c in view.columns]
     st.dataframe(
         view[show_cols].rename(columns={"web_name": "Player", "team_name": "Team", "now_cost": "£m", "pred_points_total": "Total Pred.", "pred_points_total_adj": "Adj. Total"})

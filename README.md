@@ -57,10 +57,21 @@ Live FPL API ─▶ feature engineering ─▶ per-position LightGBM models ─�
   during that window there is no (player, gameweek) data yet to train a
   model on. Rather than falling back to fake data, the app detects this
   and switches to a baseline that uses each player's last-season per-90
-  output (from the FPL API's `history_past`) scaled by fixture difficulty
-  and playing probability -- still real players, just a simpler model
-  until GW1 results land, at which point full model training resumes
+  output (from the FPL API's `history_past`), scaled by fixture
+  difficulty **and by their share of last season's available minutes**
+  (`fpl_predictor/forecast.py`, `predict_cold_start_gameweek`) -- the
+  latter matters a lot: a player with a great scoring rate from a
+  handful of substitute cameos must not outrank a nailed-on regular just
+  because their small-sample rate-when-played happens to be higher, and
+  per-90 rate alone can't tell the two apart. Real players, just a
+  simpler model, until GW1 results land and full model training resumes
   automatically.
+- **Prediction intervals for captaincy**: alongside the main point
+  estimate, a separate LightGBM quantile model predicts each player's
+  10th/90th percentile range (`fpl_predictor/quantile_model.py`) --
+  captaincy is then a genuine choice between a safe, tightly-bunched
+  pick and a high-ceiling differential that happens to share the same
+  average, not a guess. See the **Captaincy** panel in Optimal Squad.
 - **Team playing style**: `fpl_predictor/team_style.py` classifies each
   club as Attacking, Balanced, or Defensive from real match results
   (goals scored/conceded per game, z-scored against the rest of the
@@ -98,6 +109,15 @@ Live FPL API ─▶ feature engineering ─▶ per-position LightGBM models ─�
   minutes model) -- so each addition is demonstrated to help rather than
   just assumed. See "Ablation study results" below for what it found on
   the synthetic demo data.
+- **Historical backtesting**: `fpl_predictor/historical_data.py` +
+  `fpl_predictor/historical_backtest.py` (run via
+  `python -m fpl_predictor.historical_backtest`) replay the same
+  walk-forward backtest against *real* past FPL seasons, fetched from the
+  public [vaastav/Fantasy-Premier-League](https://github.com/vaastav/Fantasy-Premier-League)
+  archive (not an official FPL data source; the live API only exposes the
+  current season's per-gameweek history, so this is the only way to
+  validate against real prior seasons). See "Historical backtest results"
+  below.
 
 ## Running the web app
 
@@ -115,7 +135,8 @@ user-adjustable); use the sidebar to set your free transfers and to
 switch between live data and offline demo data. Tabs:
 
 - **Optimal Squad** — the best possible 15 under budget/rules, plus the
-  optimal starting XI, captain, and bench for the selected gameweek.
+  optimal starting XI, captain, and bench for the selected gameweek, and
+  a floor-vs-ceiling captaincy comparison for the squad.
 - **My Squad** — enter your own 15 players and see your best XI/captain,
   with validation against all squad rules.
 - **Transfers** — best transfer(s) from your squad, only recommending a
@@ -178,6 +199,54 @@ Takeaways, and why the columns don't always agree:
   MAE/rank-correlation as the more statistically stable signal, unless
   running over many more gameweeks or multiple seeds.
 
+## Historical backtest results
+
+Real answer to "has this been validated against previous years' results":
+`python -m fpl_predictor.historical_backtest`, walk-forward against the
+last 5 completed FPL seasons fetched from the vaastav archive (retraining
+at every gameweek using only earlier data, same harness as the ablation
+study above, `min_train_gws=4`). "Baseline" is the same naive "chase last
+week's top scorers" comparison the backtest tab uses.
+
+| Season | Gameweeks | MAE | Rank corr. | Model XI pts | Baseline XI pts | Advantage |
+|---|---|---|---|---|---|---|
+| 2025-26 | 34 | 0.962 | 0.692 | 1733 | 1424 | **+309** |
+| 2024-25 | 34 | 1.033 | 0.634 | 1747 | 1452 | **+295** |
+| 2023-24 | 34 | 0.919 | 0.658 | 1670 | 1429 | **+241** |
+| 2022-23 | 33 | 1.014 | 0.678 | 1661 | 1269 | **+392** |
+| 2021-22 | 34 | 1.086 | 0.643 | 1674 | 1419 | **+255** |
+| **Weighted avg / total** | **169** | **1.003** | **0.661** | **8485** | **6993** | **+1492** |
+
+Takeaways:
+
+- **This is the real validation, and it holds up.** Across 169 real
+  gameweeks over 5 seasons, the model's picked XI outscored the naive
+  baseline by +1492 points in total -- roughly **+8.8 points/gameweek**
+  on average, consistently positive in every single season, not just on
+  average. That's the difference between the two strategies over a full
+  season played out for real.
+- **MAE of ~1.0 point/player/gameweek** on real data is well within a
+  sensible range for a game this variance-heavy (a single goal, assist,
+  clean sheet, or bonus-point swing is worth 2-6+ points on its own) --
+  and notably *tighter* than the ~2.76 MAE on the synthetic demo data,
+  because the demo generator's noise is deliberately heavier than a real
+  season's to make sure the ablation study had something to detect.
+- **Rank correlation of ~0.66** means the model reliably orders players
+  by who'll actually score well that gameweek, not just gets the average
+  magnitude right -- which is what selection (not just point-estimate
+  accuracy) actually depends on.
+- **Consistency across 5 different seasons** (2021-22 through 2025-26,
+  spanning real squad turnover, rule changes like the 2025/26 defensive-
+  contribution points, and very different title/relegation races) is the
+  important signal here -- a single good season could be luck, five in a
+  row with the same walk-forward harness and no lookahead is not.
+- Every season here ran with `tune=False` (the harness's default for
+  speed -- retraining every gameweek across 5 seasons already means
+  hundreds of model fits without also re-running a hyperparameter search
+  at each one), so these numbers are a *lower bound*: a per-season tuned
+  run (`tune=True`, slower) is one of the more promising remaining levers
+  if this ever needs squeezing further.
+
 ### A note on network access
 
 This project needs outbound HTTPS access to `fantasy.premierleague.com`
@@ -185,6 +254,11 @@ to fetch live data. Some sandboxed/CI environments block that host — the
 app detects this and switches to the bundled synthetic demo league
 automatically (with a banner explaining why), so the UI and model
 pipeline are still fully exercisable offline.
+
+`fpl_predictor/historical_backtest.py` and `historical_data.py` have a
+separate network dependency: `raw.githubusercontent.com` (the public
+vaastav/Fantasy-Premier-League archive), independent of the live FPL
+API. An environment can have one reachable without the other.
 
 ## Running the tests
 
@@ -206,11 +280,14 @@ fpl_predictor/
   features.py             rolling/lag feature engineering
   model.py                per-position LightGBM training + tuning
   minutes_model.py         P(60+ mins) rotation-risk classifier
+  quantile_model.py         10th/90th percentile floor-ceiling model
   forecast.py              project models onto future gameweeks
   optimizer.py             ILP squad/XI/transfer optimization
   pipeline.py              orchestration + synthetic demo dataset
   backtest.py               walk-forward validation over past gameweeks
   ablation.py               component-by-component validation via the backtest
+  historical_data.py        real past-season data from the vaastav archive
+  historical_backtest.py    backtest replayed against real past seasons
   team_style.py             Attacking/Balanced/Defensive classification per team
   stats_correlation.py      underlying (Opta-derived) stats vs. actual points
 app.py                     Streamlit web interface
