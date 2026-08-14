@@ -50,15 +50,20 @@ PARAM_GRID = [
 ]
 
 
-def _make_regressor(params: dict) -> LGBMRegressor:
-    return LGBMRegressor(random_state=SEED, n_jobs=-1, verbosity=-1, **OBJECTIVE_PARAMS, **params)
+def _make_regressor(params: dict, objective_params: dict) -> LGBMRegressor:
+    return LGBMRegressor(random_state=SEED, n_jobs=-1, verbosity=-1, **objective_params, **params)
 
 
-def _non_negative(y: pd.Series) -> pd.Series:
-    """Clip the rare negative-points rows for Tweedie training only (it
-    requires y >= 0); evaluation should always use the true, unclipped y.
+def _prep_label(y: pd.Series, objective_params: dict) -> pd.Series:
+    """Clip the rare negative-points rows to 0 for training only when the
+    objective requires a non-negative target (Tweedie/Poisson/Gamma) --
+    evaluation should always use the true, unclipped y. A no-op for L2,
+    so an "objective ablation" comparison isn't accidentally biased by
+    also changing the training labels.
     """
-    return y.clip(lower=0)
+    if objective_params.get("objective") in ("tweedie", "poisson", "gamma"):
+        return y.clip(lower=0)
+    return y
 
 
 @dataclass
@@ -95,10 +100,10 @@ class TrainedModel:
         return preds
 
 
-def _fit_one(X_train, y_train, X_val, y_val, params) -> LGBMRegressor:
-    model = _make_regressor(params)
+def _fit_one(X_train, y_train, X_val, y_val, params, objective_params: dict) -> LGBMRegressor:
+    model = _make_regressor(params, objective_params)
     model.fit(
-        X_train, _non_negative(y_train),
+        X_train, _prep_label(y_train, objective_params),
         eval_set=[(X_val, y_val)],
         eval_metric="mae",
         callbacks=[early_stopping(stopping_rounds=50, verbose=False), log_evaluation(period=0)],
@@ -106,7 +111,7 @@ def _fit_one(X_train, y_train, X_val, y_val, params) -> LGBMRegressor:
     return model
 
 
-def _tune_position(X: pd.DataFrame, y: pd.Series, n_splits: int) -> tuple[dict, float, list[LGBMRegressor]]:
+def _tune_position(X: pd.DataFrame, y: pd.Series, n_splits: int, objective_params: dict) -> tuple[dict, float, list[LGBMRegressor]]:
     tscv = TimeSeriesSplit(n_splits=n_splits)
     best_params, best_mae, best_models = None, np.inf, []
     for params in PARAM_GRID:
@@ -114,7 +119,7 @@ def _tune_position(X: pd.DataFrame, y: pd.Series, n_splits: int) -> tuple[dict, 
         for train_idx, test_idx in tscv.split(X):
             X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
             y_tr, y_te = y.iloc[train_idx], y.iloc[test_idx]
-            model = _fit_one(X_tr, y_tr, X_te, y_te, params)
+            model = _fit_one(X_tr, y_tr, X_te, y_te, params, objective_params)
             fold_maes.append(mean_absolute_error(y_te, model.predict(X_te)))  # unclipped y_te: honest MAE
             fold_models.append(model)
         avg_mae = float(np.mean(fold_maes))
@@ -124,12 +129,16 @@ def _tune_position(X: pd.DataFrame, y: pd.Series, n_splits: int) -> tuple[dict, 
 
 
 def train_position_model(
-    feature_df: pd.DataFrame, feature_cols: list[str], position_id: int, label_col: str = "label_points", tune: bool = True,
+    feature_df: pd.DataFrame, feature_cols: list[str], position_id: int, label_col: str = "label_points",
+    tune: bool = True, objective_params: dict | None = None,
 ) -> PositionModel | None:
     """Train one position's model. ``tune=False`` skips the hyperparameter
     grid/CV and fits a single reasonable configuration directly -- much
     faster, used by the backtest harness which retrains many times over.
+    ``objective_params`` overrides the default Tweedie objective (e.g. for
+    an ablation comparison against plain L2) -- leave as None for normal use.
     """
+    objective_params = objective_params or OBJECTIVE_PARAMS
     pos_df = feature_df[feature_df["element_type"] == position_id]
     if pos_df.empty:
         return None
@@ -142,14 +151,14 @@ def train_position_model(
         # Too little data to cross-validate meaningfully (or tuning was
         # skipped for speed): fit a single reasonable config directly.
         params = PARAM_GRID[0]
-        model = _make_regressor(params)
-        model.fit(X, _non_negative(y))
+        model = _make_regressor(params, objective_params)
+        model.fit(X, _prep_label(y, objective_params))
         return PositionModel(position_id, model, float("nan"), n_samples, params, _importance_df(model, feature_cols))
 
-    best_params, best_mae, fold_models = _tune_position(X, y, n_splits)
+    best_params, best_mae, fold_models = _tune_position(X, y, n_splits, objective_params)
 
-    final_model = _make_regressor(best_params)
-    final_model.fit(X, _non_negative(y))
+    final_model = _make_regressor(best_params, objective_params)
+    final_model.fit(X, _prep_label(y, objective_params))
 
     avg_importance = np.mean([m.feature_importances_ for m in fold_models], axis=0) if fold_models else final_model.feature_importances_
     imp_df = pd.DataFrame({"feature": feature_cols, "importance": avg_importance}).sort_values("importance", ascending=False)
@@ -157,10 +166,13 @@ def train_position_model(
     return PositionModel(position_id, final_model, best_mae, n_samples, best_params, imp_df)
 
 
-def train_model(feature_df: pd.DataFrame, feature_cols: list[str], label_col: str = "label_points", tune: bool = True) -> TrainedModel:
+def train_model(
+    feature_df: pd.DataFrame, feature_cols: list[str], label_col: str = "label_points",
+    tune: bool = True, objective_params: dict | None = None,
+) -> TrainedModel:
     trained = TrainedModel(feature_cols=feature_cols)
     for pos_id in POS_MAP:
-        pm = train_position_model(feature_df, feature_cols, pos_id, label_col, tune=tune)
+        pm = train_position_model(feature_df, feature_cols, pos_id, label_col, tune=tune, objective_params=objective_params)
         if pm is not None:
             trained.positions[pos_id] = pm
     return trained

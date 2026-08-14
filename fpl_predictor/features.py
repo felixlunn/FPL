@@ -8,10 +8,10 @@ Design notes
   so a row's features only ever use information available *before* that
   gameweek kicked off -- this is what makes the eventual time-series CV
   honest (no leakage of the target into its own features).
-* Fixture difficulty is derived from the Elo ratings in
-  :mod:`fpl_predictor.data_sources.team_strength`, joined "as of" each
-  fixture's date via ``merge_asof`` so historical rows see the strength
-  each opponent actually had at the time, not their current rating.
+* Fixture difficulty comes straight from FPL's own Fixture Difficulty
+  Rating (``fpl_predictor.data_sources.fpl_api.fixtures_long_by_team``),
+  joined on (team, gameweek, opponent) -- no separate team-strength model
+  or historical data needed, and it's always as current as the live API.
 * The feature set degrades gracefully: optional columns (underlying-stats
   like expected goals only exist in recent FPL seasons) are included only
   when present, so the pipeline still works on older/partial data.
@@ -22,8 +22,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from fpl_predictor.config import canonical_team_name
-from fpl_predictor.data_sources.team_strength import EloRatings
+from fpl_predictor.config import NEUTRAL_FIXTURE_DIFFICULTY
+from fpl_predictor.data_sources.fpl_api import fixtures_long_by_team
 
 # Base rolling stats computed for every player regardless of position.
 _ROLL_SOURCE_COLS = [
@@ -48,6 +48,15 @@ _ROLL_SOURCE_COLS = [
 # Components summed into the "defensive_actions" CBIT proxy, see above.
 _DEFENSIVE_ACTION_COMPONENTS = ["tackles", "clearances_blocks_interceptions", "recoveries"]
 
+# Set-piece duty order fields from bootstrap-static (1 = primary taker, 2 =
+# second choice, ... null = not on the list). These are a *current-season
+# snapshot*, not per-gameweek history -- the live API doesn't expose who
+# took set pieces in gameweek 3 specifically, only who's currently
+# nominated. That means if duty changed hands mid-season, historical
+# training rows see today's taker rather than whoever it was at the time --
+# a known, accepted simplification given no other data source for it.
+_SET_PIECE_ORDER_COLS = ["penalties_order", "direct_freekicks_order", "corners_and_indirect_freekicks_order"]
+
 ROLLING_WINDOWS = (3, 6)
 
 # Columns always present in the resulting feature frame (used by model.py).
@@ -56,67 +65,47 @@ ROLLING_WINDOWS = (3, 6)
 # top of these by feature_columns_present().
 CORE_FEATURE_COLS = [
     "now_cost", "mins_frac_last3", "started_60_last6",
-    "form_ratio", "was_home", "team_strength", "opponent_strength", "strength_diff",
+    "form_ratio", "was_home", "fixture_difficulty",
+    "penalties_priority", "set_piece_priority",
 ]
 
 
-def _elo_timeline(elo_ratings: EloRatings) -> pd.DataFrame:
-    """Long (team, date, elo) frame of pre-match ratings for merge_asof lookups."""
-    hist = elo_ratings.history
-    if hist.empty:
-        return pd.DataFrame(columns=["team", "date", "elo"])
-    home = hist[["date", "home_team", "pre_home_elo"]].rename(columns={"home_team": "team", "pre_home_elo": "elo"})
-    away = hist[["date", "away_team", "pre_away_elo"]].rename(columns={"away_team": "team", "pre_away_elo": "elo"})
-    long_df = pd.concat([home, away], ignore_index=True)
-    long_df = long_df.dropna(subset=["date"]).sort_values(["team", "date"]).reset_index(drop=True)
-    return long_df
-
-
-def _asof_elo(dates: pd.Series, teams: pd.Series, timeline: pd.DataFrame, fallback: EloRatings) -> np.ndarray:
-    """Vectorised "Elo as of date" lookup, falling back to current rating."""
-    n = len(dates)
-    out = np.full(n, np.nan)
-    parsed_dates = pd.Series(pd.to_datetime(dates, errors="coerce", utc=True)).dt.tz_localize(None)
-    frame = pd.DataFrame({"date": parsed_dates.to_numpy(), "team": pd.Series(teams).to_numpy(), "_ord": np.arange(n)})
-    if timeline.empty:
-        vals = frame["team"].map(lambda t: fallback.strength(t))
-        return vals.to_numpy(dtype=float)
-    for team, grp in frame.groupby("team", sort=False):
-        grp_sorted = grp.sort_values("date")
-        tl = timeline[timeline["team"] == team]
-        if tl.empty or grp_sorted["date"].isna().all():
-            merged_vals = np.full(len(grp_sorted), fallback.strength(team))
-        else:
-            m = pd.merge_asof(grp_sorted, tl[["date", "elo"]], on="date", direction="backward")
-            merged_vals = m["elo"].fillna(fallback.strength(team)).to_numpy()
-        out[grp_sorted["_ord"].to_numpy()] = merged_vals
-    return out
+def _order_to_priority(series: pd.Series) -> pd.Series:
+    """1st-choice taker -> 1.0, 2nd choice -> 0.5, ..., not on the list -> 0.
+    A simple, monotonically-decreasing encoding of "how likely are they to
+    actually take it" from FPL's 1-indexed order field.
+    """
+    return series.apply(lambda o: 1.0 / o if pd.notna(o) and o and o > 0 else 0.0)
 
 
 def create_feature_frame(
     history_df: pd.DataFrame,
     players_df: pd.DataFrame,
     fixtures_df: pd.DataFrame,
-    elo_ratings: EloRatings,
 ) -> pd.DataFrame:
     """Build the (player, gameweek) training/inference table.
 
     ``history_df`` is one row per player per past gameweek (as returned by
     the FPL ``element-summary`` endpoint's ``history`` list, concatenated
     across all players). ``players_df`` carries static info (position,
-    price, team). ``fixtures_df`` provides kickoff dates and home/away
-    opponents used for the Elo "as of" lookup.
+    price, team). ``fixtures_df`` provides each fixture's FPL-assigned
+    difficulty rating, joined in per (team, gameweek, opponent).
     """
     df = history_df.copy()
     if df.empty:
         return df
 
-    player_info_cols = [c for c in ["id", "element_type", "now_cost", "team", "team_name", "web_name"] if c in players_df.columns]
+    player_info_cols = [c for c in ["id", "element_type", "now_cost", "team", "team_name", "web_name"] + _SET_PIECE_ORDER_COLS if c in players_df.columns]
     player_info = players_df[player_info_cols].rename(columns={"id": "player_id"})
     df = df.merge(player_info, on="player_id", how="left")
 
     sort_cols = ["player_id"] + (["round"] if "round" in df.columns else [])
     df = df.sort_values(sort_cols)
+
+    df["penalties_priority"] = _order_to_priority(df["penalties_order"]) if "penalties_order" in df.columns else 0.0
+    fk_priority = _order_to_priority(df["direct_freekicks_order"]) if "direct_freekicks_order" in df.columns else 0.0
+    corner_priority = _order_to_priority(df["corners_and_indirect_freekicks_order"]) if "corners_and_indirect_freekicks_order" in df.columns else 0.0
+    df["set_piece_priority"] = fk_priority + corner_priority
 
     present_def_cols = [c for c in _DEFENSIVE_ACTION_COMPONENTS if c in df.columns]
     if present_def_cols:
@@ -153,27 +142,23 @@ def create_feature_frame(
     df["now_cost"] = df["now_cost"] / 10.0
     df["form_ratio"] = (df["pts_roll3_mean"] / (df["pts_roll6_mean"] + 1e-6)).replace([np.inf, -np.inf], 0).fillna(0)
 
-    # --- fixture / opponent strength ---------------------------------------------
+    # --- fixture difficulty (FPL's own FDR) ---------------------------------------
     if "was_home" in df.columns:
         df["was_home"] = df["was_home"].astype(float)
     else:
         df["was_home"] = 0.5
 
-    kickoff = df["kickoff_time"] if "kickoff_time" in df.columns else pd.NaT
-    df["_date"] = pd.to_datetime(kickoff, errors="coerce")
-    team_names = df["team_name"].map(canonical_team_name) if "team_name" in df.columns else pd.Series("", index=df.index)
-
-    if "opponent_team" in df.columns and "team_name" in players_df.columns and "team" in players_df.columns:
-        opp_id_to_name = players_df.drop_duplicates("team")[["team", "team_name"]].set_index("team")["team_name"].to_dict()
-        opponent_names = df["opponent_team"].map(opp_id_to_name).map(canonical_team_name)
+    fixtures_long = fixtures_long_by_team(fixtures_df)[["team", "event", "opponent", "difficulty"]]
+    if "opponent_team" in df.columns and not fixtures_long.empty:
+        df = df.merge(
+            fixtures_long, how="left",
+            left_on=["team", "round", "opponent_team"], right_on=["team", "event", "opponent"],
+        )
+        df.drop(columns=[c for c in ["event", "opponent"] if c in df.columns], inplace=True)
     else:
-        opponent_names = pd.Series("", index=df.index)
-
-    timeline = _elo_timeline(elo_ratings)
-    df["team_strength"] = _asof_elo(df["_date"], team_names, timeline, elo_ratings)
-    df["opponent_strength"] = _asof_elo(df["_date"], opponent_names, timeline, elo_ratings)
-    df["strength_diff"] = df["team_strength"] - df["opponent_strength"]
-    df.drop(columns=["_date"], inplace=True)
+        df["difficulty"] = np.nan
+    df["fixture_difficulty"] = df["difficulty"].fillna(NEUTRAL_FIXTURE_DIFFICULTY)
+    df.drop(columns=["difficulty"], inplace=True)
 
     df["goal_contrib"] = df.get("goals_scored", 0) if "goals_scored" in df.columns else 0
     if "assists" in df.columns:

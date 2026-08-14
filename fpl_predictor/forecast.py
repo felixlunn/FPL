@@ -8,23 +8,25 @@ from __future__ import annotations
 
 from collections import defaultdict
 
-import numpy as np
 import pandas as pd
 
-from fpl_predictor.config import canonical_team_name
-from fpl_predictor.data_sources.team_strength import EloRatings
+from fpl_predictor.config import NEUTRAL_FIXTURE_DIFFICULTY
+from fpl_predictor.data_sources.fpl_api import fixtures_long_by_team
+from fpl_predictor.minutes_model import MinutesModel
 from fpl_predictor.model import TrainedModel
 
 
 def _fixtures_by_team_and_gw(fixtures_df: pd.DataFrame) -> dict:
-    """team_id -> gw -> list of (opponent_team_id, was_home)."""
+    """team_id -> gw -> list of (opponent_team_id, was_home, difficulty)."""
     out = defaultdict(lambda: defaultdict(list))
-    if fixtures_df is None or fixtures_df.empty:
+    long_df = fixtures_long_by_team(fixtures_df)
+    if long_df.empty:
         return out
-    for row in fixtures_df.itertuples(index=False):
-        gw = int(row.event)
-        out[row.team_h][gw].append((row.team_a, True))
-        out[row.team_a][gw].append((row.team_h, False))
+    for row in long_df.itertuples(index=False):
+        if row.event != row.event:  # NaN check
+            continue
+        difficulty = row.difficulty if row.difficulty == row.difficulty else NEUTRAL_FIXTURE_DIFFICULTY
+        out[row.team][int(row.event)].append((row.opponent, bool(row.was_home), float(difficulty)))
     return out
 
 
@@ -33,21 +35,26 @@ def predict_future_gameweeks(
     feat_df: pd.DataFrame,
     players_df: pd.DataFrame,
     fixtures_df: pd.DataFrame,
-    elo_ratings: EloRatings,
     gameweeks: list[int],
+    minutes_model: MinutesModel | None = None,
 ) -> pd.DataFrame:
     """Return one row per player with a ``GW{n}_Points`` column per requested
-    gameweek plus ``pred_points_total`` summed across all of them.
+    gameweek plus ``pred_points_total`` summed across all of them. When
+    ``minutes_model`` is given, also adds a ``start_probability`` column
+    (P(60+ minutes) for the *next* gameweek) -- computed once per player
+    rather than per fixture, since rotation-risk features don't depend on
+    which opponent they're facing, only on recent minutes pattern.
     """
     if feat_df.empty or not gameweeks:
         return pd.DataFrame()
 
     base_rows = feat_df.sort_values("round").groupby("player_id").tail(1).set_index("player_id", drop=False)
-    team_id_to_name = players_df.drop_duplicates("team").set_index("team")["team_name"].to_dict()
     fixtures_lookup = _fixtures_by_team_and_gw(fixtures_df)
     feature_cols = trained_model.feature_cols
 
     result = base_rows[["web_name", "team_name", "element_type", "now_cost", "player_id"]].copy()
+    if minutes_model is not None:
+        result["start_probability"] = minutes_model.predict_proba(base_rows)
 
     for gw in gameweeks:
         col_name = f"GW{gw}_Points"
@@ -58,21 +65,16 @@ def predict_future_gameweeks(
             fixtures_this_gw = fixtures_lookup.get(team_id, {}).get(gw, [])
             if not fixtures_this_gw:
                 continue  # blank gameweek for this team
-            team_name = canonical_team_name(team_id_to_name.get(team_id, ""))
-            team_strength = elo_ratings.strength(team_name)
 
             sim = pd.concat([team_rows] * len(fixtures_this_gw), keys=range(len(fixtures_this_gw)))
-            was_home_vals, opp_strength_vals = [], []
-            for opp_id, was_home in fixtures_this_gw:
-                opp_name = canonical_team_name(team_id_to_name.get(opp_id, ""))
+            was_home_vals, difficulty_vals = [], []
+            for opp_id, was_home, difficulty in fixtures_this_gw:
                 was_home_vals.extend([1.0 if was_home else 0.0] * len(team_rows))
-                opp_strength_vals.extend([elo_ratings.strength(opp_name)] * len(team_rows))
+                difficulty_vals.extend([difficulty] * len(team_rows))
 
             sim = sim.reset_index(level=0, drop=True)
             sim["was_home"] = was_home_vals
-            sim["opponent_strength"] = opp_strength_vals
-            sim["team_strength"] = team_strength
-            sim["strength_diff"] = team_strength - sim["opponent_strength"]
+            sim["fixture_difficulty"] = difficulty_vals
 
             for c in feature_cols:
                 if c not in sim.columns:
@@ -95,7 +97,6 @@ def predict_cold_start_gameweek(
     players_df: pd.DataFrame,
     past_seasons_df: pd.DataFrame,
     fixtures_df: pd.DataFrame,
-    elo_ratings: EloRatings,
     target_gw: int,
 ) -> pd.DataFrame:
     """Predict a single gameweek with zero current-season history to learn
@@ -105,8 +106,9 @@ def predict_cold_start_gameweek(
     of refusing to show real players, fall back to each player's own
     last-season per-90 output (from the FPL API's ``history_past``),
     scaled by an assumed ~68 minutes when selected and by fixture
-    difficulty (via Elo) -- then the usual playing-probability adjustment
-    is layered on top by the caller, exactly as for the trained-model path.
+    difficulty (FPL's own FDR) -- then the usual playing-probability
+    adjustment is layered on top by the caller, exactly as for the
+    trained-model path.
     """
     if players_df.empty:
         return pd.DataFrame()
@@ -130,7 +132,6 @@ def predict_cold_start_gameweek(
     base["_per90"] = base.apply(_per90, axis=1)
     base["_baseline_pts"] = base["_per90"] * (68.0 / 90.0)  # assumed minutes when selected
 
-    team_id_to_name = base.drop_duplicates("team").set_index("team")["team_name"].to_dict()
     fixtures_lookup = _fixtures_by_team_and_gw(fixtures_df)
 
     points = pd.Series(0.0, index=base.index)
@@ -138,13 +139,11 @@ def predict_cold_start_gameweek(
         fixtures_this_gw = fixtures_lookup.get(team_id, {}).get(target_gw, [])
         if not fixtures_this_gw:
             continue
-        team_name = canonical_team_name(team_id_to_name.get(team_id, ""))
-        team_strength = elo_ratings.strength(team_name)
         fixture_mult_total = 0.0
-        for opp_id, was_home in fixtures_this_gw:
-            opp_name = canonical_team_name(team_id_to_name.get(opp_id, ""))
-            opp_strength = elo_ratings.strength(opp_name)
-            mult = 1.0 + max(-0.3, min(0.3, (team_strength - opp_strength) / 400.0))
+        for opp_id, was_home, difficulty in fixtures_this_gw:
+            # FDR 1 (easiest) -> a boost; FDR 5 (hardest) -> a penalty; 3 is neutral.
+            mult = 1.0 + (NEUTRAL_FIXTURE_DIFFICULTY - difficulty) * 0.12
+            mult = max(0.6, min(1.4, mult))
             mult *= 1.05 if was_home else 0.97
             fixture_mult_total += mult
         points.loc[team_rows.index] = team_rows["_baseline_pts"] * fixture_mult_total
@@ -159,12 +158,21 @@ def predict_cold_start_gameweek(
 def apply_playing_probability(pred_df: pd.DataFrame, players_df: pd.DataFrame, gw_cols: list[str]) -> pd.DataFrame:
     """Scale each per-gameweek prediction (and the total) by a player's
     estimated probability of actually playing, so an injured star doesn't
-    outrank a fit squad player just on raw ability.
+    outrank a fit squad player just on raw ability. When a
+    ``start_probability`` column is present (from the minutes/rotation
+    model), the *more conservative* of the two signals is used -- the
+    API's status field catches announced injuries/doubts the minutes
+    model can't see coming, while the model catches rotation patterns
+    (a fit-but-squad-rotated player) the status field doesn't flag.
     """
     df = pred_df.merge(players_df[["id", "playing_prob"]].rename(columns={"id": "player_id"}), on="player_id", how="left")
     df["playing_prob"] = df["playing_prob"].fillna(1.0)
+    if "start_probability" in df.columns:
+        df["effective_playing_prob"] = df[["playing_prob", "start_probability"]].min(axis=1)
+    else:
+        df["effective_playing_prob"] = df["playing_prob"]
     for c in gw_cols:
         if c in df.columns:
-            df[c] = df[c] * df["playing_prob"]
-    df["pred_points_total_adj"] = df[gw_cols].sum(axis=1) if gw_cols else df.get("pred_points_total", 0.0) * df["playing_prob"]
+            df[c] = df[c] * df["effective_playing_prob"]
+    df["pred_points_total_adj"] = df[gw_cols].sum(axis=1) if gw_cols else df.get("pred_points_total", 0.0) * df["effective_playing_prob"]
     return df

@@ -29,6 +29,36 @@ def test_model_trains_for_every_position(result):
         assert pm.n_train_rows > 0
 
 
+def test_minutes_model_trained_and_start_probability_populated(result):
+    assert result.minutes_model is not None
+    assert result.minutes_model.model is not None
+    assert "start_probability" in result.pred_df.columns
+    assert result.pred_df["start_probability"].between(0, 1).all()
+    # effective_playing_prob = min(status-based, model-based) should never
+    # make the adjusted prediction exceed the raw one.
+    assert (result.pred_df["pred_points_total_adj"] <= result.pred_df["pred_points_total"] + 1e-9).all()
+
+
+def test_fixture_difficulty_feature_is_populated_and_varies(result):
+    # FPL's own FDR (1-5), joined in per (team, gameweek, opponent) --
+    # replaces the old Elo/historical-CSV team-strength model entirely.
+    assert "fixture_difficulty" in result.feat_df.columns
+    assert "fixture_difficulty" in result.feature_cols
+    assert result.feat_df["fixture_difficulty"].between(1, 5).all()
+    assert result.feat_df["fixture_difficulty"].nunique() > 1
+
+
+def test_set_piece_priority_features_are_populated_and_vary(result):
+    assert "penalties_priority" in result.feat_df.columns
+    assert "set_piece_priority" in result.feat_df.columns
+    assert "penalties_priority" in result.feature_cols
+    assert "set_piece_priority" in result.feature_cols
+    # Designated takers (order 1) should score higher than non-takers (0).
+    assert result.feat_df["penalties_priority"].max() == 1.0
+    assert (result.feat_df["penalties_priority"] == 0).any()
+    assert result.feat_df["penalties_priority"].between(0, 1).all()
+
+
 def test_defensive_contribution_features_are_picked_up(result):
     # tackles/CBI/recoveries are in the demo history -> defensive_actions
     # should get built and its rolling stats should make it into the

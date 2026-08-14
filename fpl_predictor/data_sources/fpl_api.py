@@ -91,6 +91,10 @@ def players_and_teams_from_bootstrap(bootstrap: dict) -> tuple[pd.DataFrame, pd.
         "id", "first_name", "second_name", "web_name", "now_cost", "element_type",
         "team", "team_name", "total_points", "minutes", "points_per_game", "news", "status",
         "chance_of_playing_next_round", "selected_by_percent", "form",
+        # Set-piece duty order: 1 = primary taker, 2 = second choice, etc.
+        # (null/missing = not on the list). A season-level snapshot, not
+        # per-gameweek -- see the note in features.py on what that implies.
+        "penalties_order", "direct_freekicks_order", "corners_and_indirect_freekicks_order",
     ] if c in players.columns]
     return players[cols].copy(), teams
 
@@ -119,5 +123,31 @@ def fixtures_df_from_json(fixtures_json: list) -> pd.DataFrame:
         df["event"] = df["event"].astype(int)
     keep = [c for c in [
         "id", "event", "team_h", "team_a", "team_h_difficulty", "team_a_difficulty", "kickoff_time", "finished",
+        "team_h_score", "team_a_score",
     ] if c in df.columns]
     return df[keep].copy()
+
+
+def fixtures_long_by_team(fixtures_df: pd.DataFrame) -> pd.DataFrame:
+    """Pivot the fixtures list from one-row-per-match to one-row-per-team-
+    per-fixture: ``team, event, opponent, was_home, difficulty``.
+
+    ``difficulty`` is FPL's own Fixture Difficulty Rating (1 = easiest,
+    5 = hardest) from that team's perspective for that specific fixture --
+    already maintained by FPL itself, so this needs no separate team-
+    strength model or historical data to stay current. Used for both
+    historical feature engineering (join on team+round+opponent) and
+    future-gameweek forecasting (lookup by team+gameweek).
+    """
+    cols = ["team", "event", "opponent", "was_home", "difficulty"]
+    if fixtures_df is None or fixtures_df.empty:
+        return pd.DataFrame(columns=cols)
+    df = fixtures_df.copy()
+    for c in ("team_h_difficulty", "team_a_difficulty"):
+        if c not in df.columns:
+            df[c] = float("nan")  # e.g. a fixtures source that doesn't carry FDR
+    home = df.rename(columns={"team_h": "team", "team_a": "opponent", "team_h_difficulty": "difficulty"})
+    home = home.assign(was_home=True)[cols]
+    away = df.rename(columns={"team_a": "team", "team_h": "opponent", "team_a_difficulty": "difficulty"})
+    away = away.assign(was_home=False)[cols]
+    return pd.concat([home, away], ignore_index=True)
