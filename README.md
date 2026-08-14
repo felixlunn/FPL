@@ -95,6 +95,40 @@ Live FPL API ─▶ feature engineering ─▶ per-position LightGBM models ─�
   valid formations), so results are the actual optimum given the model's
   predictions — not a greedy approximation
   (`fpl_predictor/optimizer.py`).
+- **Multiple transfer strategies**: `suggest_transfer_options` returns
+  three differently-motivated plans side by side rather than one number to
+  take or leave — **Optimal** (best net predicted points, hits included
+  when they pay off), **Safe** (best plan using only your free
+  transfer(s), never risks a −4), and **Differential** (biases toward
+  lower-ownership players, for climbing rank against a mini-league full of
+  the same template picks rather than just maximizing raw expected
+  points). See the **Transfers** tab.
+- **Fixture ticker**: every player table shows a compact "next 5"
+  fixture string (opponent + home/away), and the Season Planner tab has a
+  full team × gameweek grid colour-coded by FPL's FDR, so squad/transfer
+  decisions aren't made blind to what's actually coming up
+  (`fpl_predictor.data_sources.fpl_api.team_fixture_strings`/
+  `fixture_ticker_table`).
+- **Season planner**: `fpl_predictor/season_planner.py` rolls the same
+  trained models forward across several future gameweeks (rather than
+  just the single next one the main pipeline targets) to chart a squad's
+  points trajectory and heuristically flag the best window for each chip
+  — **Wildcard** (biggest gap between an unconstrained optimal squad and
+  yours), **Free Hit** (worst blank gameweek), **Bench Boost** (best
+  double-gameweek coverage), **Triple Captain** (single highest predicted
+  ceiling). These are transparent, stated-reason heuristics meant to
+  prompt a closer look, not another ILP claiming one provably-correct
+  answer — chip timing is a judgement call. See the **Season Planner** tab.
+- **Top-manager learnings**: `fpl_predictor/manager_insights.py` samples
+  the top-ranked managers in FPL's public "Overall" classic league (fully
+  public data, no login needed) for their chip-usage and captaincy
+  patterns. Important constraint: manager-level pick/chip history only
+  exists for the *currently in-progress* season — it resets at each
+  season boundary, unlike the player-level stats the historical backtest
+  above uses — so this tracks the current season's leaders as it unfolds
+  rather than pulling last year's winners retrospectively, which the live
+  API no longer exposes once a new season has started. See the **Top
+  managers this season** panel in Model Insights.
 - **Backtesting**: `fpl_predictor/backtest.py` replays the whole pipeline
   gameweek-by-gameweek over already-completed history -- retraining at
   each step using only earlier gameweeks -- and compares the actual
@@ -139,16 +173,22 @@ switch between live data and offline demo data. Tabs:
   a floor-vs-ceiling captaincy comparison for the squad.
 - **My Squad** — enter your own 15 players and see your best XI/captain,
   with validation against all squad rules.
-- **Transfers** — best transfer(s) from your squad, only recommending a
-  `-4` hit when the model expects it to pay off.
+- **Transfers** — three side-by-side transfer strategies (Optimal / Safe
+  / Differential) from your squad, each with its own stated rationale,
+  and each in/out player shown with their next-5 fixture run.
+- **Season Planner** — a multi-gameweek look-ahead: your squad's
+  predicted-points trend over the next several gameweeks, heuristic chip
+  timing suggestions (Wildcard/Free Hit/Bench Boost/Triple Captain), and
+  a colour-coded fixture-difficulty ticker across the same window.
 - **Player Explorer** — filterable/sortable table of every player's
-  predicted points, start probability, and points-per-million across
-  upcoming gameweeks.
+  predicted points, start probability, points-per-million, and next-5
+  fixture run across upcoming gameweeks.
 - **Model Insights** — per-position validation error, minutes-model
   Brier score, feature importance, the upcoming gameweek's fixture
-  difficulty ratings, each team's playing-style classification, and how
-  well the underlying (Opta-derived) match-performance stats actually
-  correlate with points.
+  difficulty ratings, each team's playing-style classification, how well
+  the underlying (Opta-derived) match-performance stats actually
+  correlate with points, and (opt-in) the current season's top real
+  managers' chip-usage patterns.
 - **Backtest** — walk-forward validation of the whole pipeline against
   already-completed gameweeks: actual points scored by the model's picks
   vs. a naive baseline, per-gameweek error and rank correlation.
@@ -290,6 +330,8 @@ fpl_predictor/
   historical_backtest.py    backtest replayed against real past seasons
   team_style.py             Attacking/Balanced/Defensive classification per team
   stats_correlation.py      underlying (Opta-derived) stats vs. actual points
+  season_planner.py          multi-gameweek forecast + chip-timing heuristics
+  manager_insights.py        top-manager chip/captain patterns (public Overall league)
 app.py                     Streamlit web interface
 tests/                     pytest suite (offline, uses demo data)
 ```
@@ -348,3 +390,22 @@ tests/                     pytest suite (offline, uses demo data)
   predict next gameweek's points, which is what the trained model's
   lagged/rolling features actually use) -- read the two alongside each
   other, not as substitutes.
+- Chip-timing suggestions in the Season Planner are transparent
+  heuristics (stated blank/double-gameweek counts, squad-quality gaps,
+  ceiling comparisons), not another ILP with one provably-optimal answer
+  -- real chip strategy also depends on things this model doesn't see
+  (price-rise timing, a manager's own risk tolerance, rank position in a
+  private league), so treat these as a prompt to look closer at a
+  gameweek, not an instruction to follow blindly.
+- Top-manager insights only ever reflect the *current* season as it's
+  being played -- the live FPL API doesn't retain individual managers'
+  gameweek-by-gameweek picks or chip timing once a season ends, so
+  there's no way to retrospectively pull last year's Overall-league
+  winners' decisions the way `historical_data.py` can for player-level
+  stats. Early in a season (or between seasons) this panel will have
+  little or nothing to show, by construction rather than a bug.
+- The Differential transfer strategy uses a fixed ownership-penalty
+  weight (`DIFFERENTIAL_OWNERSHIP_WEIGHT = 0.04` predicted points per %
+  owned) rather than one tuned against real rank-climbing outcomes --
+  reasonable by inspection, not empirically validated the way the main
+  model's hyperparameters are.

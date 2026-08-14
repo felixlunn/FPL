@@ -142,6 +142,58 @@ class TransferPlan:
     hit_cost: float
     raw_points: float
     net_points: float
+    strategy: str = "Optimal"
+    rationale: str = ""
+
+
+# How many predicted points a transfer plan "gives up" per percentage point
+# of ownership on a player it brings in, when searching for the Differential
+# option -- makes the ILP trade a little raw expected-points for players far
+# fewer rivals also own, which is what actually moves your rank against a
+# mini-league full of the same template picks.
+DIFFERENTIAL_OWNERSHIP_WEIGHT = 0.04
+
+
+def _best_plan_over_transfer_counts(
+    pool: pd.DataFrame,
+    current_squad_df: pd.DataFrame,
+    current_ids: set,
+    points_col: str,
+    budget: float,
+    free_transfers: int,
+    transfer_counts,
+    score_col: str | None = None,
+) -> TransferPlan | None:
+    """Search the given transfer counts and return the plan with the best
+    net *score* (``score_col`` if given, e.g. an ownership-adjusted column
+    for the Differential strategy -- else ``points_col`` itself). Raw/net
+    points on the returned plan are always the true predicted-points totals
+    regardless of what ``score_col`` was used to pick between candidates.
+    """
+    score_col = score_col or points_col
+    best_score, best_plan = None, None
+    for t in transfer_counts:
+        ids = _solve_squad_ilp(pool, score_col, budget=budget, current_ids=current_ids, transfers_equal=t)
+        if not ids:
+            continue
+        squad = pool[pool["player_id"].isin(ids)].drop_duplicates(subset=["player_id"])
+        raw_points = float(squad[points_col].sum())
+        hit_cost = TRANSFER_HIT_COST * max(0, t - free_transfers)
+        net_score = float(squad[score_col].sum()) - hit_cost
+        if best_score is None or net_score > best_score:
+            out_ids = current_ids - set(ids)
+            in_ids = set(ids) - current_ids
+            best_score = net_score
+            best_plan = TransferPlan(
+                squad_df=squad.reset_index(drop=True),
+                transfers_out=current_squad_df[current_squad_df["player_id"].isin(out_ids)]["web_name"].tolist(),
+                transfers_in=squad[squad["player_id"].isin(in_ids)]["web_name"].tolist(),
+                n_transfers=t,
+                hit_cost=hit_cost,
+                raw_points=raw_points,
+                net_points=raw_points - hit_cost,
+            )
+    return best_plan
 
 
 def suggest_transfers(
@@ -152,38 +204,79 @@ def suggest_transfers(
     budget: float = MAX_SQUAD_COST,
     points_col: str = "pred_points_total_adj",
 ) -> TransferPlan | None:
-    """Search over making 0..max_transfers_considered transfers and return
-    the plan with the best *net* predicted points (raw points minus the
-    -4 hit for each transfer beyond the free ones) -- i.e. it will only
-    recommend a hit if the model expects it to pay off.
+    """Back-compat single-plan helper: the best *net* predicted-points plan
+    across 0..max_transfers_considered transfers (only takes a hit when the
+    model expects it to pay off). See ``suggest_transfer_options`` for
+    multiple differently-motivated plans side by side.
     """
     current_ids = set(current_squad_df["player_id"])
-    # Keep the pool restricted to players affordable in principle and the
-    # current squad itself (so "0 transfers" is always a valid candidate).
     pool = pd.concat([pool_df, current_squad_df]).drop_duplicates(subset=["player_id"])
+    plan = _best_plan_over_transfer_counts(pool, current_squad_df, current_ids, points_col, budget, free_transfers, range(0, max_transfers_considered + 1))
+    if plan is not None:
+        plan.strategy = "Optimal"
+    return plan
 
-    best: TransferPlan | None = None
-    for t in range(0, max_transfers_considered + 1):
-        ids = _solve_squad_ilp(pool, points_col, budget=budget, current_ids=current_ids, transfers_equal=t)
-        if not ids:
-            continue
-        squad = pool[pool["player_id"].isin(ids)].drop_duplicates(subset=["player_id"])
-        raw_points = float(squad[points_col].sum())
-        hit_cost = TRANSFER_HIT_COST * max(0, t - free_transfers)
-        net_points = raw_points - hit_cost
-        if best is None or net_points > best.net_points:
-            out_ids = current_ids - set(ids)
-            in_ids = set(ids) - current_ids
-            best = TransferPlan(
-                squad_df=squad.reset_index(drop=True),
-                transfers_out=current_squad_df[current_squad_df["player_id"].isin(out_ids)]["web_name"].tolist(),
-                transfers_in=squad[squad["player_id"].isin(in_ids)]["web_name"].tolist(),
-                n_transfers=t,
-                hit_cost=hit_cost,
-                raw_points=raw_points,
-                net_points=net_points,
+
+def suggest_transfer_options(
+    current_squad_df: pd.DataFrame,
+    pool_df: pd.DataFrame,
+    free_transfers: int = 1,
+    max_transfers_considered: int = 3,
+    budget: float = MAX_SQUAD_COST,
+    points_col: str = "pred_points_total_adj",
+    ownership_col: str = "selected_by_percent",
+) -> dict[str, TransferPlan]:
+    """Multiple transfer plans, each optimizing for something different, so
+    a manager isn't just handed one number -- they're shown the tradeoffs:
+
+    - **Optimal**: best net predicted points, hits included if they pay off.
+    - **Safe (no hit)**: best plan using only the free transfer(s) available
+      -- never risks a -4.
+    - **Differential**: biases toward lower-ownership players (via
+      ``ownership_col``, when present in the pool) -- useful for climbing
+      rank against a mini-league full of the same template picks, which
+      raw expected-points maximization alone doesn't capture.
+
+    Any strategy whose search comes back infeasible (e.g. no valid 0-hit
+    squad exists) is simply omitted from the result rather than erroring.
+    """
+    current_ids = set(current_squad_df["player_id"])
+    pool = pd.concat([pool_df, current_squad_df]).drop_duplicates(subset=["player_id"])
+    all_counts = list(range(0, max_transfers_considered + 1))
+    plans: dict[str, TransferPlan] = {}
+
+    optimal = _best_plan_over_transfer_counts(pool, current_squad_df, current_ids, points_col, budget, free_transfers, all_counts)
+    if optimal is not None:
+        optimal.strategy = "Optimal"
+        optimal.rationale = (
+            f"Best expected net points across up to {max_transfers_considered} transfer(s) -- "
+            "takes a hit only when the model expects it to pay off."
+        )
+        plans["optimal"] = optimal
+
+    safe_counts = [t for t in all_counts if t <= free_transfers]
+    safe = _best_plan_over_transfer_counts(pool, current_squad_df, current_ids, points_col, budget, free_transfers, safe_counts)
+    if safe is not None:
+        safe.strategy = "Safe (no hit)"
+        safe.rationale = f"Best plan using only your {free_transfers} free transfer(s) -- never takes a -4 hit."
+        plans["safe"] = safe
+
+    if ownership_col in pool.columns:
+        pool_diff = pool.copy()
+        ownership_pct = pd.to_numeric(pool_diff[ownership_col], errors="coerce").fillna(0.0)
+        pool_diff["_differential_score"] = pool_diff[points_col] - ownership_pct * DIFFERENTIAL_OWNERSHIP_WEIGHT
+        differential = _best_plan_over_transfer_counts(
+            pool_diff, current_squad_df, current_ids, points_col, budget, free_transfers, all_counts, score_col="_differential_score",
+        )
+        if differential is not None:
+            differential.strategy = "Differential"
+            differential.rationale = (
+                "Leans toward lower-ownership players with strong predicted points -- for climbing rank "
+                "against the template rather than just maximizing raw expected points."
             )
-    return best
+            plans["differential"] = differential
+
+    return plans
 
 
 def validate_squad(squad_df: pd.DataFrame, budget: float = MAX_SQUAD_COST) -> dict:
