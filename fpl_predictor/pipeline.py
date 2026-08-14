@@ -136,6 +136,18 @@ class PipelineResult:
     minutes_model: MinutesModel | None = None
 
 
+def needs_demo_fallback(data: DataBundle) -> bool:
+    """True only when the live fetch itself genuinely failed (bootstrap
+    unreachable, or no players returned at all) -- NOT when history_df is
+    merely empty, which is the ordinary pre-season state (zero completed
+    gameweeks yet) that run_pipeline already handles correctly via
+    cold-start mode. Conflating the two would silently throw away real
+    player data and substitute fake demo names right when live data is
+    otherwise working fine, which is exactly what the caller wants to avoid.
+    """
+    return not data.meta.get("ok", False) or data.players_df.empty
+
+
 def _resolve_target_gw(data: DataBundle, feat_df: pd.DataFrame) -> int | None:
     """The single gameweek to predict for. Prefer the FPL API's own
     is_next/is_current flags (authoritative, and correct even pre-season

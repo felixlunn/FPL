@@ -17,7 +17,7 @@ import streamlit as st
 from fpl_predictor.backtest import BacktestReport, run_backtest
 from fpl_predictor.config import MAX_SQUAD_COST, POS_MAP
 from fpl_predictor.optimizer import build_starting_xi, find_optimal_squad, suggest_transfers, validate_squad
-from fpl_predictor.pipeline import PipelineResult, build_demo_data, fetch_live_data, run_pipeline
+from fpl_predictor.pipeline import PipelineResult, build_demo_data, fetch_live_data, needs_demo_fallback, run_pipeline
 from fpl_predictor.stats_correlation import compute_stat_correlations
 from fpl_predictor.team_style import compute_team_styles
 
@@ -44,7 +44,7 @@ def _load_pipeline(mode: str, budget_unused: float, _cache_bust: int) -> tuple[P
         data = build_demo_data()
     else:
         data = fetch_live_data()
-        if not data.meta.get("ok") or data.history_df.empty:
+        if needs_demo_fallback(data):
             demo = build_demo_data()
             demo.meta["fallback_reason"] = data.meta.get("error", "live FPL API unavailable")
             return run_pipeline(demo), demo.meta
