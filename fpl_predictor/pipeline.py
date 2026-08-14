@@ -20,6 +20,7 @@ from fpl_predictor.features import create_feature_frame, feature_columns_present
 from fpl_predictor.forecast import apply_playing_probability, predict_cold_start_gameweek, predict_future_gameweeks
 from fpl_predictor.minutes_model import MinutesModel, train_minutes_model
 from fpl_predictor.model import TrainedModel, train_model
+from fpl_predictor.quantile_model import QuantileModel, train_quantile_model
 
 
 def assign_playing_probability(status: str, news: str) -> float:
@@ -134,6 +135,7 @@ class PipelineResult:
     future_gws: list
     mode: str = "trained"  # "trained" | "cold_start" | "season_over" | "no_data"
     minutes_model: MinutesModel | None = None
+    quantile_model: QuantileModel | None = None
 
 
 def needs_demo_fallback(data: DataBundle) -> bool:
@@ -189,18 +191,19 @@ def run_pipeline(data: DataBundle) -> PipelineResult:
         if data.players_df.empty:
             return PipelineResult(data, feat_df, [], TrainedModel([]), pd.DataFrame(), gw_cols, last_completed_gw, [target_gw], mode="no_data")
         pred_df = predict_cold_start_gameweek(data.players_df, data.past_seasons_df, data.fixtures_df, target_gw)
-        trained_model, feature_cols, mode, minutes_model = TrainedModel([]), [], "cold_start", None
+        trained_model, feature_cols, mode, minutes_model, quantile_model = TrainedModel([]), [], "cold_start", None, None
     else:
         feature_cols = feature_columns_present(feat_df)
         trained_model = train_model(feat_df, feature_cols)
         minutes_model = train_minutes_model(feat_df)
-        pred_df = predict_future_gameweeks(trained_model, feat_df, data.players_df, data.fixtures_df, [target_gw], minutes_model=minutes_model)
+        quantile_model = train_quantile_model(feat_df, feature_cols)
+        pred_df = predict_future_gameweeks(trained_model, feat_df, data.players_df, data.fixtures_df, [target_gw], minutes_model=minutes_model, quantile_model=quantile_model)
         mode = "trained"
 
     if not pred_df.empty:
         pred_df = apply_playing_probability(pred_df, data.players_df, gw_cols)
 
-    return PipelineResult(data, feat_df, feature_cols, trained_model, pred_df, gw_cols, last_completed_gw, [target_gw], mode=mode, minutes_model=minutes_model)
+    return PipelineResult(data, feat_df, feature_cols, trained_model, pred_df, gw_cols, last_completed_gw, [target_gw], mode=mode, minutes_model=minutes_model, quantile_model=quantile_model)
 
 
 # ---------------------------------------------------------------------------
