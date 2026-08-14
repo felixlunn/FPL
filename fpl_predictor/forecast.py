@@ -12,6 +12,7 @@ import pandas as pd
 
 from fpl_predictor.config import NEUTRAL_FIXTURE_DIFFICULTY
 from fpl_predictor.data_sources.fpl_api import fixtures_long_by_team
+from fpl_predictor.minutes_model import MinutesModel
 from fpl_predictor.model import TrainedModel
 
 
@@ -35,9 +36,14 @@ def predict_future_gameweeks(
     players_df: pd.DataFrame,
     fixtures_df: pd.DataFrame,
     gameweeks: list[int],
+    minutes_model: MinutesModel | None = None,
 ) -> pd.DataFrame:
     """Return one row per player with a ``GW{n}_Points`` column per requested
-    gameweek plus ``pred_points_total`` summed across all of them.
+    gameweek plus ``pred_points_total`` summed across all of them. When
+    ``minutes_model`` is given, also adds a ``start_probability`` column
+    (P(60+ minutes) for the *next* gameweek) -- computed once per player
+    rather than per fixture, since rotation-risk features don't depend on
+    which opponent they're facing, only on recent minutes pattern.
     """
     if feat_df.empty or not gameweeks:
         return pd.DataFrame()
@@ -47,6 +53,8 @@ def predict_future_gameweeks(
     feature_cols = trained_model.feature_cols
 
     result = base_rows[["web_name", "team_name", "element_type", "now_cost", "player_id"]].copy()
+    if minutes_model is not None:
+        result["start_probability"] = minutes_model.predict_proba(base_rows)
 
     for gw in gameweeks:
         col_name = f"GW{gw}_Points"
@@ -150,12 +158,21 @@ def predict_cold_start_gameweek(
 def apply_playing_probability(pred_df: pd.DataFrame, players_df: pd.DataFrame, gw_cols: list[str]) -> pd.DataFrame:
     """Scale each per-gameweek prediction (and the total) by a player's
     estimated probability of actually playing, so an injured star doesn't
-    outrank a fit squad player just on raw ability.
+    outrank a fit squad player just on raw ability. When a
+    ``start_probability`` column is present (from the minutes/rotation
+    model), the *more conservative* of the two signals is used -- the
+    API's status field catches announced injuries/doubts the minutes
+    model can't see coming, while the model catches rotation patterns
+    (a fit-but-squad-rotated player) the status field doesn't flag.
     """
     df = pred_df.merge(players_df[["id", "playing_prob"]].rename(columns={"id": "player_id"}), on="player_id", how="left")
     df["playing_prob"] = df["playing_prob"].fillna(1.0)
+    if "start_probability" in df.columns:
+        df["effective_playing_prob"] = df[["playing_prob", "start_probability"]].min(axis=1)
+    else:
+        df["effective_playing_prob"] = df["playing_prob"]
     for c in gw_cols:
         if c in df.columns:
-            df[c] = df[c] * df["playing_prob"]
-    df["pred_points_total_adj"] = df[gw_cols].sum(axis=1) if gw_cols else df.get("pred_points_total", 0.0) * df["playing_prob"]
+            df[c] = df[c] * df["effective_playing_prob"]
+    df["pred_points_total_adj"] = df[gw_cols].sum(axis=1) if gw_cols else df.get("pred_points_total", 0.0) * df["effective_playing_prob"]
     return df

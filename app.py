@@ -17,7 +17,9 @@ import streamlit as st
 from fpl_predictor.backtest import BacktestReport, run_backtest
 from fpl_predictor.config import MAX_SQUAD_COST, POS_MAP
 from fpl_predictor.optimizer import build_starting_xi, find_optimal_squad, suggest_transfers, validate_squad
-from fpl_predictor.pipeline import PipelineResult, build_demo_data, fetch_live_data, run_pipeline
+from fpl_predictor.pipeline import PipelineResult, build_demo_data, fetch_live_data, needs_demo_fallback, run_pipeline
+from fpl_predictor.stats_correlation import compute_stat_correlations
+from fpl_predictor.team_style import compute_team_styles
 
 st.set_page_config(page_title="FPL Predictor", page_icon="⚽", layout="wide")
 
@@ -25,6 +27,10 @@ st.set_page_config(page_title="FPL Predictor", page_icon="⚽", layout="wide")
 # everywhere a position is colour-coded so identity mapping never shifts.
 POSITION_COLORS = {1: "#2a78d6", 2: "#eb6834", 3: "#1baf7a", 4: "#eda100"}
 SERIES_BLUE, SERIES_ORANGE = "#2a78d6", "#eb6834"
+# Diverging pair (blue <-> red) for the attacking/defensive team-style axis,
+# neutral gray for "Balanced" -- same diverging convention as the rest of
+# the app's charts, just applied to a style spectrum instead of a delta.
+STYLE_COLORS = {"Attacking": "#e34948", "Balanced": "#8a8a8a", "Defensive": "#2a78d6"}
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +44,7 @@ def _load_pipeline(mode: str, budget_unused: float, _cache_bust: int) -> tuple[P
         data = build_demo_data()
     else:
         data = fetch_live_data()
-        if not data.meta.get("ok") or data.history_df.empty:
+        if needs_demo_fallback(data):
             demo = build_demo_data()
             demo.meta["fallback_reason"] = data.meta.get("error", "live FPL API unavailable")
             return run_pipeline(demo), demo.meta
@@ -97,10 +103,37 @@ def _backtest_mae_chart(df: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def _team_style_chart(styles_df: pd.DataFrame) -> go.Figure:
+    df = styles_df.sort_values("style_score")
+    colors = [STYLE_COLORS.get(s, "#8a8a8a") for s in df["style"]]
+    fig = go.Figure(go.Bar(x=df["style_score"], y=df["team_name"], orientation="h", marker_color=colors))
+    fig.add_vline(x=0, line_width=1, line_color="rgba(128,128,128,0.5)")
+    fig.update_layout(title="Team playing style (attack lean vs. defence lean)", xaxis_title="← more defensive · more attacking →",
+                       height=max(320, 28 * len(df)), margin=dict(l=10, r=10, t=40, b=10), showlegend=False)
+    return fig
+
+
+def _stat_correlation_chart(corr_df: pd.DataFrame) -> go.Figure:
+    df = corr_df.sort_values("pearson_r")
+    fig = go.Figure(go.Bar(x=df["pearson_r"], y=df["stat"], orientation="h", marker_color=SERIES_BLUE))
+    fig.update_layout(title="Correlation with actual points scored (same gameweek)", xaxis_title="Pearson r",
+                       height=max(280, 32 * len(df)), margin=dict(l=10, r=10, t=40, b=10), showlegend=False)
+    return fig
+
+
 def _lineup_table(df: pd.DataFrame, gw_col: str, captain_id=None, vice_id=None) -> pd.DataFrame:
-    out = df[["web_name", "team_name", "element_type", "now_cost", gw_col]].copy()
+    cols = ["web_name", "team_name", "element_type", "now_cost", gw_col]
+    has_start_prob = "start_probability" in df.columns
+    if has_start_prob:
+        cols.append("start_probability")
+    out = df[cols].copy()
     out["POS"] = out["element_type"].map(POS_MAP)
-    out = out.drop(columns=["element_type"]).rename(columns={"web_name": "Player", "team_name": "Team", "now_cost": "£m", gw_col: "Pred. Pts"})
+    out = out.drop(columns=["element_type"])
+    rename = {"web_name": "Player", "team_name": "Team", "now_cost": "£m", gw_col: "Pred. Pts"}
+    if has_start_prob:
+        out["start_probability"] = (out["start_probability"] * 100).round(0).astype(int).astype(str) + "%"
+        rename["start_probability"] = "Start %"
+    out = out.rename(columns=rename)
     if captain_id is not None:
         out.insert(0, "", ["\U0001f451" if pid == captain_id else ("\U0001f948" if pid == vice_id else "") for pid in df["player_id"]])
     return out.reset_index(drop=True)
@@ -122,7 +155,8 @@ if st.sidebar.button("\U0001f504 Refresh data & retrain model"):
     st.session_state.cache_bust += 1
     st.cache_resource.clear()
 
-budget = st.sidebar.number_input("Budget (£m)", min_value=50.0, max_value=150.0, value=MAX_SQUAD_COST, step=0.5)
+budget = MAX_SQUAD_COST  # the real FPL budget -- fixed, not user-adjustable
+st.sidebar.metric("Budget", f"£{budget:.0f}m")
 free_transfers = st.sidebar.number_input("Free transfers", min_value=0, max_value=5, value=1, step=1)
 
 with st.spinner("Fetching data and training the model (walk-forward CV + hyperparameter search)..."):
@@ -284,7 +318,12 @@ with tab_explorer:
         view = view[view["web_name"].str.contains(search, case=False, na=False)]
     view["PPM"] = (view["pred_points_total_adj"] / view["now_cost"]).round(2)
 
+    if "start_probability" in view.columns:
+        view["Start %"] = (view["start_probability"] * 100).round(0).astype(int)
+
     show_cols = ["web_name", "team_name", "POS", "now_cost"] + result.gw_cols + ["pred_points_total", "pred_points_total_adj", "PPM"]
+    if "Start %" in view.columns:
+        show_cols.append("Start %")
     show_cols = [c for c in show_cols if c in view.columns]
     st.dataframe(
         view[show_cols].rename(columns={"web_name": "Player", "team_name": "Team", "now_cost": "£m", "pred_points_total": "Total Pred.", "pred_points_total_adj": "Adj. Total"})
@@ -303,7 +342,7 @@ with tab_model:
         )
     else:
         st.caption("Per-position LightGBM models, tuned via walk-forward (time-series) cross-validation.")
-        mcols = st.columns(4)
+        mcols = st.columns(5)
         for col, (pos_id, pos_label) in zip(mcols, POS_MAP.items()):
             pm = result.trained_model.positions.get(pos_id)
             with col:
@@ -312,6 +351,12 @@ with tab_model:
                 else:
                     mae_display = f"{pm.mae:.2f}" if pm.mae == pm.mae else "n/a"  # NaN check
                     st.metric(f"{pos_label} MAE", mae_display, help=f"{pm.n_train_rows} training rows")
+        with mcols[4]:
+            mm = result.minutes_model
+            if mm is not None and mm.model is not None:
+                st.metric("Minutes model Brier", f"{mm.brier_score:.3f}", help="P(60+ mins next GW) classifier — lower Brier score is better (0 = perfect, 0.25 = coin-flip-level)")
+            else:
+                st.metric("Minutes model", "n/a", help="Not enough data yet to train a rotation-risk model this season")
 
         imp_cols = st.columns(2)
         shown = 0
@@ -338,6 +383,34 @@ with tab_model:
                 st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
             else:
                 st.caption(f"No fixtures found for GW{gw} (blank gameweek).")
+
+    with st.expander("Team playing styles (Attacking / Balanced / Defensive)"):
+        st.caption(
+            "From real match results (goals scored/conceded per game vs. the rest of the league) -- a *style* axis, "
+            "not a quality one: a team excellent at both scoring and defending lands as Balanced (no lopsided "
+            "trade-off), same as a team mediocre at both."
+        )
+        styles = compute_team_styles(result.data.fixtures_df, result.data.teams_df)
+        if styles.empty:
+            st.caption("No finished matches yet this season to classify styles from.")
+        else:
+            st.plotly_chart(_team_style_chart(styles), use_container_width=True, theme="streamlit")
+            show = styles[["team_name", "style", "goals_scored_per_game", "goals_conceded_per_game", "games_played"]]
+            st.dataframe(show.rename(columns={"team_name": "Team", "style": "Style", "goals_scored_per_game": "Scored/gm", "goals_conceded_per_game": "Conceded/gm", "games_played": "Games"}), hide_index=True, use_container_width=True)
+
+    with st.expander("Underlying stats vs. actual points (Opta-derived)"):
+        st.caption(
+            "How well FPL's underlying match-performance stats -- themselves derived from Opta match event data -- "
+            "actually correlate with points scored that same gameweek. A raw Opta feed integration would need a "
+            "separate commercial license this project doesn't have; these aggregate stats are already Opta-derived "
+            "and already available via the FPL API."
+        )
+        corr = compute_stat_correlations(result.data.history_df)
+        if corr.empty:
+            st.caption("Not enough completed-gameweek history yet to compute correlations.")
+        else:
+            st.plotly_chart(_stat_correlation_chart(corr), use_container_width=True, theme="streamlit")
+            st.dataframe(corr.rename(columns={"stat": "Stat", "pearson_r": "Pearson r", "spearman_r": "Spearman r", "n": "N"}), hide_index=True, use_container_width=True)
 
 # --- Backtest ------------------------------------------------------------
 with tab_backtest:

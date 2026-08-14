@@ -48,6 +48,15 @@ _ROLL_SOURCE_COLS = [
 # Components summed into the "defensive_actions" CBIT proxy, see above.
 _DEFENSIVE_ACTION_COMPONENTS = ["tackles", "clearances_blocks_interceptions", "recoveries"]
 
+# Set-piece duty order fields from bootstrap-static (1 = primary taker, 2 =
+# second choice, ... null = not on the list). These are a *current-season
+# snapshot*, not per-gameweek history -- the live API doesn't expose who
+# took set pieces in gameweek 3 specifically, only who's currently
+# nominated. That means if duty changed hands mid-season, historical
+# training rows see today's taker rather than whoever it was at the time --
+# a known, accepted simplification given no other data source for it.
+_SET_PIECE_ORDER_COLS = ["penalties_order", "direct_freekicks_order", "corners_and_indirect_freekicks_order"]
+
 ROLLING_WINDOWS = (3, 6)
 
 # Columns always present in the resulting feature frame (used by model.py).
@@ -57,7 +66,16 @@ ROLLING_WINDOWS = (3, 6)
 CORE_FEATURE_COLS = [
     "now_cost", "mins_frac_last3", "started_60_last6",
     "form_ratio", "was_home", "fixture_difficulty",
+    "penalties_priority", "set_piece_priority",
 ]
+
+
+def _order_to_priority(series: pd.Series) -> pd.Series:
+    """1st-choice taker -> 1.0, 2nd choice -> 0.5, ..., not on the list -> 0.
+    A simple, monotonically-decreasing encoding of "how likely are they to
+    actually take it" from FPL's 1-indexed order field.
+    """
+    return series.apply(lambda o: 1.0 / o if pd.notna(o) and o and o > 0 else 0.0)
 
 
 def create_feature_frame(
@@ -77,12 +95,17 @@ def create_feature_frame(
     if df.empty:
         return df
 
-    player_info_cols = [c for c in ["id", "element_type", "now_cost", "team", "team_name", "web_name"] if c in players_df.columns]
+    player_info_cols = [c for c in ["id", "element_type", "now_cost", "team", "team_name", "web_name"] + _SET_PIECE_ORDER_COLS if c in players_df.columns]
     player_info = players_df[player_info_cols].rename(columns={"id": "player_id"})
     df = df.merge(player_info, on="player_id", how="left")
 
     sort_cols = ["player_id"] + (["round"] if "round" in df.columns else [])
     df = df.sort_values(sort_cols)
+
+    df["penalties_priority"] = _order_to_priority(df["penalties_order"]) if "penalties_order" in df.columns else 0.0
+    fk_priority = _order_to_priority(df["direct_freekicks_order"]) if "direct_freekicks_order" in df.columns else 0.0
+    corner_priority = _order_to_priority(df["corners_and_indirect_freekicks_order"]) if "corners_and_indirect_freekicks_order" in df.columns else 0.0
+    df["set_piece_priority"] = fk_priority + corner_priority
 
     present_def_cols = [c for c in _DEFENSIVE_ACTION_COMPONENTS if c in df.columns]
     if present_def_cols:

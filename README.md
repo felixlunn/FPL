@@ -24,10 +24,11 @@ Live FPL API ─▶ feature engineering ─▶ per-position LightGBM models ─�
   as current as the live API itself.
 - **Features**: rolling/lag stats (points, minutes, bps, ICT index,
   expected goals/assists where available) computed strictly from *past*
-  gameweeks, plus fixture difficulty and home/away, and defensive-
-  contribution volume (tackles/clearances/blocks/interceptions/recoveries,
-  feeding the 2025/26 defensive-contribution scoring rule). See
-  `fpl_predictor/features.py`.
+  gameweeks, plus fixture difficulty and home/away, defensive-contribution
+  volume (tackles/clearances/blocks/interceptions/recoveries, feeding the
+  2025/26 defensive-contribution scoring rule), and set-piece duty
+  (penalty/free-kick/corner taker priority, from the API's `*_order`
+  fields). See `fpl_predictor/features.py`.
 - **Model**: a separate LightGBM regressor per position (GKP/DEF/MID/FWD),
   since clean sheets matter for defenders and goals matter for attackers,
   trained with a Tweedie objective (rather than plain L2) to match how
@@ -35,6 +36,14 @@ Live FPL API ─▶ feature engineering ─▶ per-position LightGBM models ─�
   chosen by walk-forward (`TimeSeriesSplit`) cross-validation, never on
   future gameweeks, so validation MAE reflects real predictive skill
   (`fpl_predictor/model.py`).
+- **Minutes/rotation-risk model**: a separate LightGBM classifier predicts
+  each player's P(60+ minutes) in the upcoming gameweek from their recent
+  minutes pattern, independent of scoring ability -- shown in the UI as a
+  Start % on its own, and blended with the API's status field (whichever
+  is more conservative) to scale predicted points, so a fit-but-rotated
+  player is treated differently from an announced injury even though
+  neither shows up the same way in the raw status field
+  (`fpl_predictor/minutes_model.py`).
 - **Forecasting**: the app always predicts exactly one gameweek -- the
   next one that hasn't been played yet, determined from the FPL API's own
   `is_next` event flag (not by guessing from completed-gameweek history,
@@ -52,6 +61,23 @@ Live FPL API ─▶ feature engineering ─▶ per-position LightGBM models ─�
   and playing probability -- still real players, just a simpler model
   until GW1 results land, at which point full model training resumes
   automatically.
+- **Team playing style**: `fpl_predictor/team_style.py` classifies each
+  club as Attacking, Balanced, or Defensive from real match results
+  (goals scored/conceded per game, z-scored against the rest of the
+  league) -- a *style* axis, not a quality one, so a team that's simply
+  bad at both ends doesn't get mislabeled "Attacking" just for being
+  relatively less bad at scoring than conceding. See the **Team playing
+  styles** panel in Model Insights.
+- **Underlying stats vs. points**: `fpl_predictor/stats_correlation.py`
+  quantifies how well FPL's underlying match-performance stats -- xG/xA,
+  ICT index and its components, all themselves derived from Opta match
+  event data licensed to the Premier League/FPL -- actually correlate
+  with points scored that gameweek. A raw Opta feed integration would
+  need a separate commercial license this project doesn't have; this
+  answers the same question ("does strong match performance predict FPL
+  points?") using the Opta-derived stats already available via the FPL
+  API. See the **Underlying stats vs. actual points** panel in Model
+  Insights.
 - **Optimization**: squad selection, starting XI, and transfer
   suggestions are all solved as integer linear programs (PuLP/CBC)
   against the real FPL rules (£100m budget, 15-man squad, max 3 per club,
@@ -65,6 +91,13 @@ Live FPL API ─▶ feature engineering ─▶ per-position LightGBM models ─�
   week's top scorers" baseline. This is the real validation of whether
   the tool is useful, not just what its cross-validation error looks
   like; see the **Backtest** tab in the app.
+- **Ablation study**: `fpl_predictor/ablation.py` (run via
+  `python -m fpl_predictor.ablation`) uses that same backtest to compare
+  the full pipeline against variants with one component removed at a time
+  (Tweedie, defensive-contribution features, FDR, set-piece features, the
+  minutes model) -- so each addition is demonstrated to help rather than
+  just assumed. See "Ablation study results" below for what it found on
+  the synthetic demo data.
 
 ## Running the web app
 
@@ -77,7 +110,8 @@ streamlit run app.py
 Open the URL Streamlit prints (defaults to http://localhost:8501).
 
 The app always targets the single upcoming gameweek (shown in the
-sidebar); use the sidebar to set your budget and free transfers, and to
+sidebar). The budget is fixed at the real FPL squad budget (£100m, not
+user-adjustable); use the sidebar to set your free transfers and to
 switch between live data and offline demo data. Tabs:
 
 - **Optimal Squad** — the best possible 15 under budget/rules, plus the
@@ -87,12 +121,62 @@ switch between live data and offline demo data. Tabs:
 - **Transfers** — best transfer(s) from your squad, only recommending a
   `-4` hit when the model expects it to pay off.
 - **Player Explorer** — filterable/sortable table of every player's
-  predicted points and points-per-million across upcoming gameweeks.
-- **Model Insights** — per-position validation error and feature
-  importance, plus the upcoming gameweek's fixture difficulty ratings.
+  predicted points, start probability, and points-per-million across
+  upcoming gameweeks.
+- **Model Insights** — per-position validation error, minutes-model
+  Brier score, feature importance, the upcoming gameweek's fixture
+  difficulty ratings, each team's playing-style classification, and how
+  well the underlying (Opta-derived) match-performance stats actually
+  correlate with points.
 - **Backtest** — walk-forward validation of the whole pipeline against
   already-completed gameweeks: actual points scored by the model's picks
   vs. a naive baseline, per-gameweek error and rank correlation.
+
+## Ablation study results
+
+Run with `python -m fpl_predictor.ablation` against the synthetic demo
+dataset (13 backtested gameweeks, 96 players); see the module docstring
+to run it against real data instead. Positive `vs. full` means removing
+that component made the model-picked XI score *fewer* real points over
+the backtest window -- i.e. the component was pulling its weight.
+
+| Variant removed | MAE | Rank corr. | XI points vs. full |
+|---|---|---|---|
+| *(full model)* | 2.76 | 0.148 | — |
+| Tweedie (→ plain L2) | 2.72 (better) | 0.157 (better) | **−43** |
+| Defensive-contribution features | 2.76 (≈same) | 0.151 (≈same) | **−21** |
+| Fixture difficulty (FDR) | 2.82 (worse) | 0.122 (worse) | +10 |
+| Set-piece priority features | 2.76 (≈same) | 0.149 (≈same) | **−8** |
+| Minutes/rotation model | 2.66 (better) | 0.146 (≈same) | **−34** |
+
+Takeaways, and why the columns don't always agree:
+
+- **FDR** is the one component confirmed by *every* metric (removing it
+  makes MAE and rank correlation both clearly worse) -- expected, since
+  it's the single feature deliberately built with the strongest causal
+  relationship to points in the synthetic generator.
+- **Tweedie and the minutes model** show a real tension: removing either
+  one slightly *improves* raw per-player MAE, but clearly *reduces* the
+  actual points the model's squad picks would have scored. This makes
+  sense once you separate the two goals -- Tweedie trades a little
+  average-case accuracy for a better-shaped right tail (getting big
+  hauls right matters more for squad selection than getting every 0-4
+  point week exactly right), and the minutes model deliberately shades
+  down uncertain players even in weeks they'd have scored fine, which
+  costs a bit of raw accuracy but avoids picking players who don't
+  actually play. **MAE alone would have told us to drop both of these --
+  the realized-points metric is what actually catches their value.**
+- **Defensive-contribution and set-piece features** show only a small
+  effect here, which is plausible given how infrequently their triggering
+  conditions (hitting the CBIT threshold; scoring a nominated penalty)
+  actually fire within 13 gameweeks -- a longer backtest window (a full
+  real season) would be needed to say more with confidence.
+- The realized-points metric is the most intuitive but also the noisiest
+  of the three (a single backtest run over a modest number of gameweeks,
+  with squad-selection cutoffs that can flip discontinuously on small
+  ranking changes) -- treat single-run point swings as suggestive, and
+  MAE/rank-correlation as the more statistically stable signal, unless
+  running over many more gameweeks or multiple seeds.
 
 ### A note on network access
 
@@ -121,32 +205,41 @@ fpl_predictor/
     fpl_api.py            live FPL API fetch + disk cache + fixture-difficulty lookup
   features.py             rolling/lag feature engineering
   model.py                per-position LightGBM training + tuning
+  minutes_model.py         P(60+ mins) rotation-risk classifier
   forecast.py              project models onto future gameweeks
   optimizer.py             ILP squad/XI/transfer optimization
   pipeline.py              orchestration + synthetic demo dataset
   backtest.py               walk-forward validation over past gameweeks
+  ablation.py               component-by-component validation via the backtest
+  team_style.py             Attacking/Balanced/Defensive classification per team
+  stats_correlation.py      underlying (Opta-derived) stats vs. actual points
 app.py                     Streamlit web interface
 tests/                     pytest suite (offline, uses demo data)
 ```
 
 ## Limitations / next steps
 
-- Playing-probability comes straight from the FPL API's own status/news
-  field; a dedicated minutes-prediction model would improve rotation risk
-  handling for bench players.
 - The cold-start (pre-season) baseline is a simple heuristic, not a
   learned model -- it's meant to keep the app useful with real players
   before any current-season data exists, not to match the trained
   model's accuracy.
 - Transfer search caps at a small number of transfers per run (adjustable
   in the UI) since it re-solves the full ILP per candidate transfer count.
-- Defensive-contribution stat field names (`tackles`,
-  `clearances_blocks_interceptions`, `recoveries`) are based on the
-  publicly documented 2025/26 API shape but haven't been verified against
-  a live payload from this sandbox (no network access here). Each
-  `DataBundle.meta["history_columns"]` lists exactly what fields a real
-  fetch returned, so this is easy to confirm/correct once run with live
-  data -- unmatched names are silently skipped rather than erroring.
+- Defensive-contribution and set-piece-order stat field names (`tackles`,
+  `clearances_blocks_interceptions`, `recoveries`, `penalties_order`,
+  `direct_freekicks_order`, `corners_and_indirect_freekicks_order`) are
+  based on the publicly documented current API shape but haven't been
+  verified against a live payload from this sandbox (no network access
+  here). Each `DataBundle.meta["history_columns"]` lists exactly what
+  fields a real fetch returned, so this is easy to confirm/correct once
+  run with live data -- unmatched names are silently skipped rather than
+  erroring.
+- Set-piece duty (`*_order`) is a *current-season snapshot*, not
+  per-gameweek history -- the live API doesn't expose who took penalties
+  in gameweek 3 specifically, only who's nominated today. If duty changed
+  hands mid-season, historical training rows see today's taker rather
+  than whoever it actually was at the time. No other data source exists
+  for this without an external provider.
 - The backtest rebuilds a fresh optimal squad from scratch every
   gameweek within budget; it deliberately doesn't model real transfer
   limits (free transfers, `-4` hits, one squad carried across the
@@ -159,3 +252,22 @@ tests/                     pytest suite (offline, uses demo data)
   granular, at the cost of needing separate data and upkeep -- the FDR
   approach was chosen deliberately over that trade-off for simplicity and
   staying automatically current with no extra data source to maintain.
+- The ablation study above was run on synthetic demo data because this
+  sandbox has no live network access -- useful for confirming the
+  *methodology* isolates each component correctly and for a rough sanity
+  check, but the actual magnitudes (and even direction, for the smaller
+  effects) should be re-checked against a real season once one's
+  available; the demo generator's causal relationships are a
+  simplification of the real game.
+- Team playing style is inferred purely from goals scored/conceded --
+  real tactical identity (shot volume, possession, pressing intensity)
+  needs shot/event-level data this project doesn't have access to
+  (see the Opta note above). Goals are a noisier proxy: a team can look
+  "Balanced" simply because a small sample of games hasn't yet separated
+  its scoring and defending form, not because it's tactically balanced.
+- The underlying-stats correlation panel reports *same-gameweek*
+  correlation (did strong performance and points coincide), which is a
+  different question from *predictive* value (does this gameweek's stat
+  predict next gameweek's points, which is what the trained model's
+  lagged/rolling features actually use) -- read the two alongside each
+  other, not as substitutes.
