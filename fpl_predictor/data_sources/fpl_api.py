@@ -151,3 +151,56 @@ def fixtures_long_by_team(fixtures_df: pd.DataFrame) -> pd.DataFrame:
     away = df.rename(columns={"team_a": "team", "team_h": "opponent", "team_a_difficulty": "difficulty"})
     away = away.assign(was_home=False)[cols]
     return pd.concat([home, away], ignore_index=True)
+
+
+def team_fixture_strings(fixtures_df: pd.DataFrame, teams_df: pd.DataFrame, from_gw: int, n: int = 5) -> dict:
+    """team_id -> compact "OPP(H) OPP(A) ..." string of each team's next
+    ``n`` fixtures from ``from_gw`` onward, for a per-player "what's coming
+    up" column in player tables. A double gameweek shows both fixtures.
+    """
+    long_df = fixtures_long_by_team(fixtures_df)
+    if long_df.empty or teams_df is None or teams_df.empty:
+        return {}
+    team_short = {row.id: str(row.name)[:3].upper() for row in teams_df.itertuples()}
+    upcoming = long_df[long_df["event"] >= from_gw].sort_values("event")
+    out = {}
+    for team_id, grp in upcoming.groupby("team"):
+        parts = [f"{team_short.get(r.opponent, '???')}({'H' if r.was_home else 'A'})" for r in grp.head(n).itertuples()]
+        out[team_id] = " ".join(parts)
+    return out
+
+
+def fixture_ticker_table(fixtures_df: pd.DataFrame, teams_df: pd.DataFrame, from_gw: int, n_gws: int = 6) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """A team x gameweek grid for a visual fixture-difficulty ticker.
+
+    Returns ``(labels, difficulty)`` -- same shape, indexed by team name
+    with one column per gameweek in range. ``labels`` holds display strings
+    ("OPP (H)", or "OPP1(H) + OPP2(A)" for a double gameweek, "-" for a
+    blank); ``difficulty`` holds the matching numeric FDR (the *easier* of
+    the two on a double gameweek) so a caller can colour the cells --
+    kept separate rather than baked into the label so any renderer works,
+    not just ones that can parse the FDR back out of display text.
+    """
+    long_df = fixtures_long_by_team(fixtures_df)
+    if long_df.empty or teams_df is None or teams_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    team_name = dict(zip(teams_df["id"], teams_df["name"]))
+    team_short = {tid: str(name)[:3].upper() for tid, name in team_name.items()}
+    gws = list(range(from_gw, from_gw + n_gws))
+    cols = [f"GW{g}" for g in gws]
+    names = [team_name[t] for t in sorted(team_name)]
+    labels = pd.DataFrame("-", index=names, columns=cols, dtype=object)
+    difficulty = pd.DataFrame(float("nan"), index=names, columns=cols, dtype=float)
+
+    sub = long_df[long_df["event"].isin(gws)]
+    for row in sub.itertuples():
+        tname = team_name.get(row.team)
+        if tname is None:
+            continue
+        col = f"GW{row.event}"
+        label = f"{team_short.get(row.opponent, '???')}({'H' if row.was_home else 'A'})"
+        cur = labels.at[tname, col]
+        labels.at[tname, col] = label if cur == "-" else f"{cur} + {label}"
+        cur_d = difficulty.at[tname, col]
+        difficulty.at[tname, col] = row.difficulty if pd.isna(cur_d) else min(cur_d, row.difficulty)
+    return labels, difficulty

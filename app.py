@@ -14,10 +14,13 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+import fpl_predictor.manager_insights as manager_insights
 from fpl_predictor.backtest import BacktestReport, run_backtest
 from fpl_predictor.config import MAX_SQUAD_COST, POS_MAP
-from fpl_predictor.optimizer import build_starting_xi, find_optimal_squad, suggest_transfers, validate_squad
+from fpl_predictor.data_sources.fpl_api import fixture_ticker_table, team_fixture_strings
+from fpl_predictor.optimizer import build_starting_xi, find_optimal_squad, suggest_transfer_options, validate_squad
 from fpl_predictor.pipeline import PipelineResult, build_demo_data, fetch_live_data, needs_demo_fallback, run_pipeline
+from fpl_predictor.season_planner import DEFAULT_HORIZON, build_multi_gw_forecast, recommend_chip_windows
 from fpl_predictor.stats_correlation import compute_stat_correlations
 from fpl_predictor.team_style import compute_team_styles
 
@@ -161,6 +164,8 @@ def _lineup_table(df: pd.DataFrame, gw_col: str, captain_id=None, vice_id=None) 
     cols = ["web_name", "team_name", "element_type", "now_cost", gw_col]
     if prob_col:
         cols.append(prob_col)
+    if "Next 5" in df.columns:
+        cols.append("Next 5")
     out = df[cols].copy()
     out["POS"] = out["element_type"].map(POS_MAP)
     out = out.drop(columns=["element_type"])
@@ -234,12 +239,20 @@ if pred_df.empty:
     st.error(f"No predictions available for GW{gw} (e.g. a blank gameweek with no fixtures). Try refreshing.")
     st.stop()
 
+# A compact "what's coming up" string per player (e.g. "ARS(H) LIV(A) ...")
+# so every table that shows a player also shows their upcoming run of
+# fixtures, not just this week's predicted points in isolation.
+_team_name_to_id = dict(zip(result.data.teams_df["name"], result.data.teams_df["id"])) if not result.data.teams_df.empty else {}
+_fixture_str_by_team = team_fixture_strings(result.data.fixtures_df, result.data.teams_df, gw, n=5)
+pred_df = pred_df.copy()
+pred_df["Next 5"] = pred_df["team_name"].map(_team_name_to_id).map(_fixture_str_by_team).fillna("")
+
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-tab_optimal, tab_mine, tab_transfers, tab_explorer, tab_model, tab_backtest = st.tabs(
-    ["\U0001f3c6 Optimal Squad", "\U0001f464 My Squad", "\U0001f504 Transfers", "\U0001f50d Player Explorer",
-     "\U0001f4ca Model Insights", "\U0001f9ea Backtest"]
+tab_optimal, tab_mine, tab_transfers, tab_planner, tab_explorer, tab_model, tab_backtest = st.tabs(
+    ["\U0001f3c6 Optimal Squad", "\U0001f464 My Squad", "\U0001f504 Transfers", "\U0001f4c5 Season Planner",
+     "\U0001f50d Player Explorer", "\U0001f4ca Model Insights", "\U0001f9ea Backtest"]
 )
 
 # --- Optimal squad ----------------------------------------------------------
@@ -321,7 +334,10 @@ with tab_mine:
 
 # --- Transfers ---------------------------------------------------------------
 with tab_transfers:
-    st.caption("Uses your squad from the 'My Squad' tab as the starting point.")
+    st.caption(
+        "Uses your squad from the 'My Squad' tab as the starting point. Three strategies are shown side by side, "
+        "each optimizing for something different, rather than handing you a single number to take or leave."
+    )
     all_ids = [pid for ids in st.session_state.get("my_squad", {}).values() for pid in ids]
     my_squad_df = pred_df[pred_df["player_id"].isin(all_ids)].drop_duplicates(subset=["player_id"])
     if len(my_squad_df) != 15:
@@ -329,23 +345,85 @@ with tab_transfers:
     else:
         max_hits = st.slider("Max transfers to consider", 0, 5, 3)
         with st.spinner("Searching transfer combinations..."):
-            plan = suggest_transfers(my_squad_df, pred_df, free_transfers=free_transfers, max_transfers_considered=max_hits, budget=budget, points_col="pred_points_total_adj")
-        if plan is None:
+            plans = suggest_transfer_options(my_squad_df, pred_df, free_transfers=free_transfers, max_transfers_considered=max_hits, budget=budget, points_col="pred_points_total_adj")
+        if not plans:
             st.error("No feasible transfer plan found.")
-        elif plan.n_transfers == 0:
-            st.success(f"No transfers recommended — your squad is already optimal (or close to it) for GW{gw}.")
         else:
-            hit_note = f" (−{plan.hit_cost:.0f} pt hit)" if plan.hit_cost else ""
-            st.success(f"Recommended: {plan.n_transfers} transfer(s){hit_note} — net gain {plan.net_points - my_squad_df['pred_points_total_adj'].sum():.1f} pts for GW{gw}")
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown("**Out**")
-                for name in plan.transfers_out:
-                    st.markdown(f"\U0001f53b {name}")
-            with c2:
-                st.markdown("**In**")
-                for name in plan.transfers_in:
-                    st.markdown(f"\U0001f53a {name}")
+            name_to_fixture = dict(zip(pred_df["web_name"], pred_df["Next 5"]))
+            current_pts = float(my_squad_df["pred_points_total_adj"].sum())
+            strategy_order = [k for k in ("optimal", "safe", "differential") if k in plans]
+            strategy_tabs = st.tabs([plans[k].strategy for k in strategy_order])
+            for key, stab in zip(strategy_order, strategy_tabs):
+                plan = plans[key]
+                with stab:
+                    st.caption(plan.rationale)
+                    if plan.n_transfers == 0:
+                        st.success(f"No transfers recommended — this squad is already the best fit for GW{gw} under this strategy.")
+                    else:
+                        hit_note = f" (−{plan.hit_cost:.0f} pt hit)" if plan.hit_cost else ""
+                        st.success(f"{plan.n_transfers} transfer(s){hit_note} — net gain {plan.net_points - current_pts:.1f} pts for GW{gw}")
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.markdown("**Out**")
+                            for name in plan.transfers_out:
+                                fx = name_to_fixture.get(name, "")
+                                st.markdown(f"\U0001f53b **{name}**" + (f"  \n<span style='opacity:0.65;font-size:0.85em'>{fx}</span>" if fx else ""), unsafe_allow_html=True)
+                        with c2:
+                            st.markdown("**In**")
+                            for name in plan.transfers_in:
+                                fx = name_to_fixture.get(name, "")
+                                st.markdown(f"\U0001f53a **{name}**" + (f"  \n<span style='opacity:0.65;font-size:0.85em'>{fx}</span>" if fx else ""), unsafe_allow_html=True)
+
+# --- Season planner ----------------------------------------------------------
+with tab_planner:
+    st.caption(
+        "A rolling look-ahead across the next several gameweeks, reusing the same trained models -- where your "
+        "squad's outlook is trending, plus heuristic timing suggestions for the four chips (Wildcard / Free Hit / "
+        "Bench Boost / Triple Captain). Chip timing is a judgement call, not something with one provably-correct "
+        "answer -- treat these as prompts to look closer, not instructions to follow blindly."
+    )
+    horizon = st.slider("Look-ahead window (gameweeks)", 2, 8, DEFAULT_HORIZON, key="planner_horizon")
+    with st.spinner("Projecting future gameweeks..."):
+        multi_pred, planner_gws = build_multi_gw_forecast(result, n_gws=horizon)
+
+    if multi_pred.empty:
+        st.info("Not enough data to build a multi-gameweek forecast right now.")
+    else:
+        all_ids = [pid for ids in st.session_state.get("my_squad", {}).values() for pid in ids]
+        if len(all_ids) == 15:
+            planner_squad_df = pred_df[pred_df["player_id"].isin(all_ids)].drop_duplicates(subset=["player_id"])
+            squad_label = "your squad"
+        else:
+            planner_squad_df = find_optimal_squad(pred_df, budget=budget, points_col="pred_points_total_adj")
+            squad_label = "the current optimal squad (complete 'My Squad' to plan around your own)"
+
+        gw_cols_planner = [f"GW{g}_Points" for g in planner_gws]
+        squad_pred = multi_pred[multi_pred["player_id"].isin(planner_squad_df["player_id"])]
+        trend = pd.DataFrame({"gw": planner_gws, "points": [float(squad_pred[c].sum()) for c in gw_cols_planner]})
+        trend_fig = go.Figure(go.Scatter(x=trend["gw"], y=trend["points"], mode="lines+markers", line=dict(color=SERIES_BLUE, width=3), marker=dict(size=8)))
+        trend_fig.update_layout(title=f"Predicted total points per gameweek — {squad_label}", xaxis_title="Gameweek",
+                                 yaxis_title="Predicted points", height=320, margin=dict(l=10, r=10, t=40, b=10))
+        st.plotly_chart(trend_fig, use_container_width=True, theme="streamlit")
+
+        st.subheader("Chip timing suggestions")
+        recs = recommend_chip_windows(multi_pred, planner_gws, result.data.fixtures_df, result.data.teams_df, current_squad_df=planner_squad_df)
+        if not recs:
+            st.caption("Nothing stands out in this window yet — no major blank/double gameweeks or squad-quality gaps detected.")
+        else:
+            for r in recs:
+                st.info(f"**{r.chip} — GW{r.gw}**: {r.reason}")
+
+        st.subheader("Fixture ticker")
+        st.caption("Green = easier fixtures (low FDR), red = harder (high FDR). '+' marks a double gameweek.")
+        labels, difficulty = fixture_ticker_table(result.data.fixtures_df, result.data.teams_df, gw, n_gws=horizon)
+        if labels.empty:
+            st.caption("No fixture data available.")
+        else:
+            try:
+                styled = labels.style.background_gradient(cmap="RdYlGn_r", gmap=difficulty.fillna(3.0), vmin=1, vmax=5, axis=None)
+                st.dataframe(styled, use_container_width=True)
+            except Exception:
+                st.dataframe(labels, use_container_width=True)
 
 # --- Player explorer ----------------------------------------------------------
 with tab_explorer:
@@ -369,7 +447,7 @@ with tab_explorer:
         view["Reliability %"] = (view["last_season_reliability"] * 100).round(0).astype(int)
 
     show_cols = ["web_name", "team_name", "POS", "now_cost"] + result.gw_cols + ["pred_points_total", "pred_points_total_adj", "PPM"]
-    for extra in ("Start %", "Reliability %"):
+    for extra in ("Start %", "Reliability %", "Next 5"):
         if extra in view.columns:
             show_cols.append(extra)
     show_cols = [c for c in show_cols if c in view.columns]
@@ -459,6 +537,26 @@ with tab_model:
         else:
             st.plotly_chart(_stat_correlation_chart(corr), use_container_width=True, theme="streamlit")
             st.dataframe(corr.rename(columns={"stat": "Stat", "pearson_r": "Pearson r", "spearman_r": "Spearman r", "n": "N"}), hide_index=True, use_container_width=True)
+
+    with st.expander("Top managers this season (public Overall league)"):
+        st.caption(
+            "Chip timing from the top-ranked managers in FPL's public 'Overall' classic league — fully public data, "
+            "no login needed. Manager-level pick/chip history only exists for the season currently in progress (it "
+            "resets at each season boundary, unlike the player-level stats the historical backtest above uses), so "
+            "this tracks the *current* season's leaders as it unfolds rather than a retrospective look at last "
+            "year's winners, whose pick history is no longer retrievable now a new season has started."
+        )
+        if st.button("\U0001f4e1 Fetch top-manager chip usage", key="fetch_manager_insights"):
+            with st.spinner("Sampling the top-ranked managers' chip history (one request per manager)..."):
+                st.session_state["manager_insights"] = manager_insights.summarize_top_manager_chips()
+        mi_result = st.session_state.get("manager_insights")
+        if mi_result is None:
+            st.caption("Click to fetch — queries roughly 50 managers individually, so it's opt-in rather than automatic on every page load.")
+        elif not mi_result.ok:
+            st.caption(mi_result.message)
+        else:
+            st.caption(f"Sampled {mi_result.n_managers_sampled} top managers.")
+            st.dataframe(mi_result.chip_usage.rename(columns={"chip": "Chip", "gw": "GW", "n_managers": "# Managers"}), hide_index=True, use_container_width=True)
 
 # --- Backtest ------------------------------------------------------------
 with tab_backtest:
