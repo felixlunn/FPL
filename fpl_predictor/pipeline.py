@@ -245,8 +245,14 @@ def build_demo_data(n_gws: int = 10, n_future_gws: int = 5, seed: int = SEED) ->
     players_df["playing_prob"] = 1.0
     teams_df = pd.DataFrame({"id": range(1, len(_DEMO_TEAMS) + 1), "name": _DEMO_TEAMS})
 
+    # Each team's average player quality doubles as a crude "attack
+    # strength" for simulating plausible match scores below (team_style.py
+    # needs real-looking scorelines to classify playing styles from).
+    team_strength = {tid: float(np.mean([p["_quality"] for p in players if p["team"] == tid])) for tid in range(1, len(_DEMO_TEAMS) + 1)}
+
     # Round-robin-ish fixture list: each gameweek, pair teams up, with a
-    # random FPL-style 1-5 difficulty rating per side of each fixture.
+    # random FPL-style 1-5 difficulty rating per side of each fixture, and
+    # a simulated final score for already-played gameweeks (gw <= n_gws).
     # "schedule" also drives each player's per-gameweek history below, so
     # the two stay internally consistent (a player's recorded opponent
     # really is who their team played that gameweek) -- important now that
@@ -262,9 +268,16 @@ def build_demo_data(n_gws: int = 10, n_future_gws: int = 5, seed: int = SEED) ->
         for i in range(0, len(shuffled) - 1, 2):
             home, away = shuffled[i], shuffled[i + 1]
             home_difficulty, away_difficulty = int(rng.integers(1, 6)), int(rng.integers(1, 6))
+            finished = gw <= n_gws
+            if finished:
+                home_score = int(rng.poisson(0.8 + 1.4 * team_strength[home]))
+                away_score = int(rng.poisson(0.5 + 1.1 * team_strength[away]))  # mild home advantage
+            else:
+                home_score = away_score = None
             fixtures_rows.append({
                 "id": fid, "event": gw, "team_h": home, "team_a": away,
                 "team_h_difficulty": home_difficulty, "team_a_difficulty": away_difficulty,
+                "team_h_score": home_score, "team_a_score": away_score, "finished": finished,
             })
             schedule[home][gw] = (away, True, home_difficulty)
             schedule[away][gw] = (home, False, away_difficulty)

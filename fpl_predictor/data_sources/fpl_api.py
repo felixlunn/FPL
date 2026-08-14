@@ -123,6 +123,7 @@ def fixtures_df_from_json(fixtures_json: list) -> pd.DataFrame:
         df["event"] = df["event"].astype(int)
     keep = [c for c in [
         "id", "event", "team_h", "team_a", "team_h_difficulty", "team_a_difficulty", "kickoff_time", "finished",
+        "team_h_score", "team_a_score",
     ] if c in df.columns]
     return df[keep].copy()
 

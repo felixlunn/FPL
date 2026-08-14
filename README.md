@@ -61,6 +61,23 @@ Live FPL API ─▶ feature engineering ─▶ per-position LightGBM models ─�
   and playing probability -- still real players, just a simpler model
   until GW1 results land, at which point full model training resumes
   automatically.
+- **Team playing style**: `fpl_predictor/team_style.py` classifies each
+  club as Attacking, Balanced, or Defensive from real match results
+  (goals scored/conceded per game, z-scored against the rest of the
+  league) -- a *style* axis, not a quality one, so a team that's simply
+  bad at both ends doesn't get mislabeled "Attacking" just for being
+  relatively less bad at scoring than conceding. See the **Team playing
+  styles** panel in Model Insights.
+- **Underlying stats vs. points**: `fpl_predictor/stats_correlation.py`
+  quantifies how well FPL's underlying match-performance stats -- xG/xA,
+  ICT index and its components, all themselves derived from Opta match
+  event data licensed to the Premier League/FPL -- actually correlate
+  with points scored that gameweek. A raw Opta feed integration would
+  need a separate commercial license this project doesn't have; this
+  answers the same question ("does strong match performance predict FPL
+  points?") using the Opta-derived stats already available via the FPL
+  API. See the **Underlying stats vs. actual points** panel in Model
+  Insights.
 - **Optimization**: squad selection, starting XI, and transfer
   suggestions are all solved as integer linear programs (PuLP/CBC)
   against the real FPL rules (£100m budget, 15-man squad, max 3 per club,
@@ -93,7 +110,8 @@ streamlit run app.py
 Open the URL Streamlit prints (defaults to http://localhost:8501).
 
 The app always targets the single upcoming gameweek (shown in the
-sidebar); use the sidebar to set your budget and free transfers, and to
+sidebar). The budget is fixed at the real FPL squad budget (£100m, not
+user-adjustable); use the sidebar to set your free transfers and to
 switch between live data and offline demo data. Tabs:
 
 - **Optimal Squad** — the best possible 15 under budget/rules, plus the
@@ -103,10 +121,13 @@ switch between live data and offline demo data. Tabs:
 - **Transfers** — best transfer(s) from your squad, only recommending a
   `-4` hit when the model expects it to pay off.
 - **Player Explorer** — filterable/sortable table of every player's
-  predicted points and points-per-million across upcoming gameweeks.
+  predicted points, start probability, and points-per-million across
+  upcoming gameweeks.
 - **Model Insights** — per-position validation error, minutes-model
-  Brier score, feature importance, plus the upcoming gameweek's fixture
-  difficulty ratings.
+  Brier score, feature importance, the upcoming gameweek's fixture
+  difficulty ratings, each team's playing-style classification, and how
+  well the underlying (Opta-derived) match-performance stats actually
+  correlate with points.
 - **Backtest** — walk-forward validation of the whole pipeline against
   already-completed gameweeks: actual points scored by the model's picks
   vs. a naive baseline, per-gameweek error and rank correlation.
@@ -190,6 +211,8 @@ fpl_predictor/
   pipeline.py              orchestration + synthetic demo dataset
   backtest.py               walk-forward validation over past gameweeks
   ablation.py               component-by-component validation via the backtest
+  team_style.py             Attacking/Balanced/Defensive classification per team
+  stats_correlation.py      underlying (Opta-derived) stats vs. actual points
 app.py                     Streamlit web interface
 tests/                     pytest suite (offline, uses demo data)
 ```
@@ -236,3 +259,15 @@ tests/                     pytest suite (offline, uses demo data)
   effects) should be re-checked against a real season once one's
   available; the demo generator's causal relationships are a
   simplification of the real game.
+- Team playing style is inferred purely from goals scored/conceded --
+  real tactical identity (shot volume, possession, pressing intensity)
+  needs shot/event-level data this project doesn't have access to
+  (see the Opta note above). Goals are a noisier proxy: a team can look
+  "Balanced" simply because a small sample of games hasn't yet separated
+  its scoring and defending form, not because it's tactically balanced.
+- The underlying-stats correlation panel reports *same-gameweek*
+  correlation (did strong performance and points coincide), which is a
+  different question from *predictive* value (does this gameweek's stat
+  predict next gameweek's points, which is what the trained model's
+  lagged/rolling features actually use) -- read the two alongside each
+  other, not as substitutes.
